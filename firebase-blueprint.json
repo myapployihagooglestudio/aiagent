@@ -1,0 +1,253 @@
+{
+  "entities": {
+    "BotSettings": {
+      "title": "BotSettings",
+      "description": "Persistent global OMNIA AI Telegram bot settings, owner lock, Business connection state, style profile, multimodal toggles, and automation rules.",
+      "type": "object",
+      "properties": {
+        "uiLanguage": { "type": "string", "enum": ["uz_lat", "uz_cyr", "uz_new", "ru", "en"], "maxLength": 16 },
+        "defaultReplyLanguage": { "type": "string", "enum": ["auto", "uz_lat", "uz_cyr", "uz_new", "ru", "en"], "maxLength": 16 },
+        "responseStyle": { "type": "string", "enum": ["concise", "warm", "executive", "formal"], "maxLength": 24 },
+        "verbosityMode": { "type": "string", "enum": ["short", "balanced", "detailed"], "maxLength": 24 },
+        "emojiLevel": { "type": "string", "enum": ["none", "subtle", "expressive"], "maxLength": 24 },
+        "customStyleExamples": { "type": "string", "maxLength": 2000 },
+        "autoReplyMode": { "type": "string", "enum": ["autonomous", "manual_approval", "off"], "maxLength": 24 },
+        "autonomousEnabled": { "type": "boolean" },
+        "paused": { "type": "boolean" },
+        "botPaused": { "type": "boolean" },
+        "businessPaused": { "type": "boolean" },
+        "emergencyStop": { "type": "boolean" },
+        "voiceReplyEnabled": { "type": "boolean" },
+        "voiceOutputMode": { "type": "string", "enum": ["text", "voice", "both"], "maxLength": 16 },
+        "ttsVoice": { "type": "string", "enum": ["Kore", "Puck", "Charon", "Fenrir", "Zephyr"], "maxLength": 16 },
+        "voiceStyle": { "type": "string", "enum": ["calm", "warm", "energetic", "formal"], "maxLength": 24 },
+        "speakingSpeed": { "type": "string", "enum": ["slow", "normal", "fast"], "maxLength": 16 },
+        "autoTranscribeVoice": { "type": "boolean" },
+        "autoAnalyzeVideo": { "type": "boolean" },
+        "videoReplyEnabled": { "type": "boolean" },
+        "callsEnabled": { "type": "boolean" },
+        "aiConsentConfirmed": { "type": "boolean" },
+        "disclosureEnabled": { "type": "boolean" },
+        "disclosureText": { "type": "string", "maxLength": 300 },
+        "confidenceThreshold": { "type": "number" },
+        "rateLimitPerMinute": { "type": "number" },
+        "personaPrompt": { "type": "string", "maxLength": 4000 },
+        "memorySummary": { "type": "string", "maxLength": 6000 },
+        "escalationKeywords": { "type": "string", "maxLength": 1000 },
+        "ownerTelegramId": { "type": "number" },
+        "ownerUsername": { "type": "string", "maxLength": 64 },
+        "businessConnectionId": { "type": "string", "maxLength": 128 },
+        "connectionEnabled": { "type": "boolean" },
+        "businessOwnerId": { "type": "number" },
+        "businessOwnerName": { "type": "string", "maxLength": 120 },
+        "rightsCanReply": { "type": "boolean" },
+        "rightsCanReadMessages": { "type": "boolean" },
+        "rightsCanDeleteSent": { "type": "boolean" },
+        "lastWebhookAt": { "type": "string", "maxLength": 64 },
+        "lastWebhookEvent": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "uiLanguage",
+        "autoReplyMode",
+        "autonomousEnabled",
+        "paused",
+        "emergencyStop",
+        "aiConsentConfirmed",
+        "updatedAt"
+      ]
+    },
+    "ChatRule": {
+      "title": "ChatRule",
+      "description": "Per-chat permission (allow, manual_approve, exclude), AI consent, style override, and 24-hour Business reply window timestamp.",
+      "type": "object",
+      "properties": {
+        "channel": { "type": "string", "enum": ["bot_direct", "business_chat"], "maxLength": 24 },
+        "chatId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^-?[0-9]+$" },
+        "contactName": { "type": "string", "maxLength": 120 },
+        "username": { "type": "string", "maxLength": 64 },
+        "permission": { "type": "string", "enum": ["allow", "manual_approve", "exclude"], "maxLength": 20 },
+        "aiConsentGranted": { "type": "boolean" },
+        "styleOverride": { "type": "string", "maxLength": 1000 },
+        "notes": { "type": "string", "maxLength": 2000 },
+        "lastInboundAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["channel", "chatId", "permission", "updatedAt"]
+    },
+    "MemoryEntry": {
+      "title": "MemoryEntry",
+      "description": "Structured, scoped long-term assistant memory entry with category, provenance, and optional TTL expiration.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["preference", "style", "owner_fact", "task", "summary", "chat_context", "instruction", "temp"],
+          "maxLength": 32
+        },
+        "scope": { "type": "string", "enum": ["owner", "chat"], "maxLength": 16 },
+        "channel": { "type": "string", "enum": ["bot_direct", "business_chat", "global"], "maxLength": 24 },
+        "chatId": { "type": "string", "maxLength": 64 },
+        "content": { "type": "string", "minLength": 1, "maxLength": 1500 },
+        "provenance": { "type": "string", "maxLength": 64 },
+        "tags": { "type": "string", "maxLength": 300 },
+        "expiresAtMs": { "type": "number" },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["type", "scope", "channel", "content", "createdAtMs", "createdAt", "updatedAt"]
+    },
+    "ConversationSummary": {
+      "title": "ConversationSummary",
+      "description": "Parent conversation metadata isolating bot_direct and business_chat threads.",
+      "type": "object",
+      "properties": {
+        "channel": { "type": "string", "enum": ["bot_direct", "business_chat"], "maxLength": 24 },
+        "chatId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["channel", "chatId", "updatedAt"]
+    },
+    "ConversationMessage": {
+      "title": "ConversationMessage",
+      "description": "Stored conversation turn (text, transcript, media type, status).",
+      "type": "object",
+      "properties": {
+        "channel": { "type": "string", "enum": ["bot_direct", "business_chat"], "maxLength": 24 },
+        "chatId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "telegramMessageId": { "type": "number" },
+        "role": { "type": "string", "enum": ["user", "assistant", "owner"], "maxLength": 16 },
+        "mediaType": { "type": "string", "enum": ["text", "voice", "photo", "video", "video_note", "document"], "maxLength": 24 },
+        "text": { "type": "string", "maxLength": 8000 },
+        "transcript": { "type": "string", "maxLength": 8000 },
+        "status": { "type": "string", "enum": ["received", "sent", "pending_approval", "rejected", "edited", "deleted", "failed"], "maxLength": 24 },
+        "seq": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["channel", "chatId", "role", "mediaType", "text", "status", "seq", "createdAt"]
+    },
+    "PendingApproval": {
+      "title": "PendingApproval",
+      "description": "AI-drafted reply awaiting owner approval inside Telegram.",
+      "type": "object",
+      "properties": {
+        "chatId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "contactName": { "type": "string", "maxLength": 120 },
+        "businessConnectionId": { "type": "string", "maxLength": 128 },
+        "replyToMessageId": { "type": "number" },
+        "incomingText": { "type": "string", "maxLength": 4000 },
+        "incomingMediaType": { "type": "string", "maxLength": 32 },
+        "draftReply": { "type": "string", "maxLength": 4000 },
+        "escalationReason": { "type": "string", "maxLength": 300 },
+        "confidenceScore": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "expired"], "maxLength": 16 },
+        "notificationMessageId": { "type": "number" },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["chatId", "draftReply", "status", "createdAtMs", "createdAt", "updatedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Operational and error audit log entry.",
+      "type": "object",
+      "properties": {
+        "channel": { "type": "string", "enum": ["bot_direct", "business_chat", "system"], "maxLength": 24 },
+        "eventType": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "severity": { "type": "string", "enum": ["info", "warn", "error", "critical"], "maxLength": 16 },
+        "chatId": { "type": "string", "maxLength": 64 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "details": { "type": "string", "maxLength": 2000 },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["channel", "eventType", "severity", "summary", "createdAtMs", "createdAt"]
+    },
+    "MessageQueueJob": {
+      "title": "MessageQueueJob",
+      "description": "Server-only persistent message-processing queue item.",
+      "type": "object",
+      "properties": {
+        "channel": { "type": "string", "enum": ["bot_direct", "business_chat"], "maxLength": 24 },
+        "chatId": { "type": "string", "maxLength": 64 },
+        "messageId": { "type": "number" },
+        "payloadJson": { "type": "string", "maxLength": 32000 },
+        "status": { "type": "string", "enum": ["queued", "processing", "done", "dead_letter"], "maxLength": 20 },
+        "attempts": { "type": "number" },
+        "lastError": { "type": "string", "maxLength": 1000 },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["channel", "chatId", "messageId", "payloadJson", "status", "attempts", "createdAtMs", "createdAt"]
+    },
+    "UserLanguagePreference": {
+      "title": "UserLanguagePreference",
+      "description": "Persistent per-Telegram-user language and script preference surviving restarts.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[0-9]+$" },
+        "preferredLanguage": { "type": "string", "enum": ["auto", "uz_lat", "uz_cyr", "uz_new", "ru", "en"], "maxLength": 16 },
+        "uiLanguage": { "type": "string", "enum": ["uz_lat", "uz_cyr", "uz_new", "ru", "en"], "maxLength": 16 },
+        "username": { "type": "string", "maxLength": 64 },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "preferredLanguage", "uiLanguage", "updatedAt"]
+    },
+    "DedupLock": {
+      "title": "DedupLock",
+      "description": "Server-only atomic idempotency lock preventing duplicate webhook/message processing.",
+      "type": "object",
+      "properties": {
+        "dedupKey": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["dedupKey", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/system/{docId}": {
+      "schema": { "$ref": "#/entities/BotSettings" },
+      "description": "Global persistent bot settings document (bot_settings)."
+    },
+    "/user_preferences/{userId}": {
+      "schema": { "$ref": "#/entities/UserLanguagePreference" },
+      "description": "Persistent per-user language preference keyed by Telegram user ID."
+    },
+    "/chat_rules/{ruleId}": {
+      "schema": { "$ref": "#/entities/ChatRule" },
+      "description": "Per-chat permission and reply-window records keyed by {channel}__{chatId}."
+    },
+    "/memories/{memoryId}": {
+      "schema": { "$ref": "#/entities/MemoryEntry" },
+      "description": "Structured long-term assistant memory items scoped strictly by owner or (channel, chatId)."
+    },
+    "/conversations/{convId}": {
+      "schema": { "$ref": "#/entities/ConversationSummary" },
+      "description": "Parent thread container keyed by {channel}__{chatId}."
+    },
+    "/conversations/{convId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ConversationMessage" },
+      "description": "Message turns and audio/video transcripts for a conversation."
+    },
+    "/pending_approvals/{approvalId}": {
+      "schema": { "$ref": "#/entities/PendingApproval" },
+      "description": "AI-drafted replies awaiting owner approval in Telegram."
+    },
+    "/audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Operational activity and error audit log."
+    },
+    "/message_queue/{jobId}": {
+      "schema": { "$ref": "#/entities/MessageQueueJob" },
+      "description": "Server-only asynchronous Telegram message processing queue."
+    },
+    "/dedup/{dedupId}": {
+      "schema": { "$ref": "#/entities/DedupLock" },
+      "description": "Server-only duplicate update/message prevention locks."
+    }
+  }
+}

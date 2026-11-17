@@ -1,0 +1,250 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidChannel(channel) {
+      return channel in ['bot_direct', 'business_chat'];
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwnerAdmin() {
+      return isSignedIn() && request.auth.token.email == 'mirzayevulugbek024@gmail.com';
+    }
+
+    function isValidBotSettings(data) {
+      return data.keys().hasAll([
+          'uiLanguage', 'autoReplyMode', 'autonomousEnabled', 'paused',
+          'emergencyStop', 'aiConsentConfirmed', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uiLanguage', 'defaultReplyLanguage', 'responseStyle', 'verbosityMode',
+          'emojiLevel', 'customStyleExamples', 'autoReplyMode',
+          'autonomousEnabled', 'paused', 'botPaused', 'businessPaused',
+          'emergencyStop', 'voiceReplyEnabled', 'voiceOutputMode',
+          'ttsVoice', 'voiceStyle', 'speakingSpeed',
+          'autoTranscribeVoice', 'autoAnalyzeVideo', 'videoReplyEnabled',
+          'callsEnabled', 'aiConsentConfirmed',
+          'disclosureEnabled', 'disclosureText', 'confidenceThreshold',
+          'rateLimitPerMinute', 'personaPrompt', 'memorySummary', 'escalationKeywords',
+          'ownerTelegramId', 'ownerUsername', 'businessConnectionId',
+          'connectionEnabled', 'businessOwnerId', 'businessOwnerName',
+          'rightsCanReply', 'rightsCanReadMessages', 'rightsCanDeleteSent',
+          'lastWebhookAt', 'lastWebhookEvent', 'updatedAt'
+        ])
+        && data.uiLanguage in ['uz_lat', 'uz_cyr', 'uz_new', 'ru', 'en']
+        && (!('defaultReplyLanguage' in data) || data.defaultReplyLanguage in ['auto', 'uz_lat', 'uz_cyr', 'uz_new', 'ru', 'en'])
+        && (!('responseStyle' in data) || data.responseStyle in ['concise', 'warm', 'executive', 'formal'])
+        && (!('verbosityMode' in data) || data.verbosityMode in ['short', 'balanced', 'detailed'])
+        && (!('emojiLevel' in data) || data.emojiLevel in ['none', 'subtle', 'expressive'])
+        && (!('customStyleExamples' in data) || (data.customStyleExamples is string && data.customStyleExamples.size() <= 2000))
+        && data.autoReplyMode in ['autonomous', 'manual_approval', 'off']
+        && data.autonomousEnabled is bool
+        && data.paused is bool
+        && (!('botPaused' in data) || data.botPaused is bool)
+        && (!('businessPaused' in data) || data.businessPaused is bool)
+        && data.emergencyStop is bool
+        && data.aiConsentConfirmed is bool
+        && (!('voiceReplyEnabled' in data) || data.voiceReplyEnabled is bool)
+        && (!('voiceOutputMode' in data) || data.voiceOutputMode in ['text', 'voice', 'both'])
+        && (!('ttsVoice' in data) || data.ttsVoice in ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'])
+        && (!('voiceStyle' in data) || data.voiceStyle in ['calm', 'warm', 'energetic', 'formal'])
+        && (!('speakingSpeed' in data) || data.speakingSpeed in ['slow', 'normal', 'fast'])
+        && (!('autoTranscribeVoice' in data) || data.autoTranscribeVoice is bool)
+        && (!('autoAnalyzeVideo' in data) || data.autoAnalyzeVideo is bool)
+        && (!('videoReplyEnabled' in data) || data.videoReplyEnabled is bool)
+        && (!('callsEnabled' in data) || data.callsEnabled is bool)
+        && (!('disclosureEnabled' in data) || data.disclosureEnabled is bool)
+        && (!('disclosureText' in data) || (data.disclosureText is string && data.disclosureText.size() <= 300))
+        && (!('confidenceThreshold' in data) || (data.confidenceThreshold is number && data.confidenceThreshold >= 0 && data.confidenceThreshold <= 100))
+        && (!('rateLimitPerMinute' in data) || (data.rateLimitPerMinute is number && data.rateLimitPerMinute >= 1 && data.rateLimitPerMinute <= 60))
+        && (!('personaPrompt' in data) || (data.personaPrompt is string && data.personaPrompt.size() <= 4000))
+        && (!('memorySummary' in data) || (data.memorySummary is string && data.memorySummary.size() <= 6000))
+        && (!('escalationKeywords' in data) || (data.escalationKeywords is string && data.escalationKeywords.size() <= 1000))
+        && (!('ownerTelegramId' in data) || data.ownerTelegramId is number)
+        && (!('ownerUsername' in data) || (data.ownerUsername is string && data.ownerUsername.size() <= 64))
+        && (!('businessConnectionId' in data) || (data.businessConnectionId is string && data.businessConnectionId.size() <= 128))
+        && (!('connectionEnabled' in data) || data.connectionEnabled is bool)
+        && (!('businessOwnerId' in data) || data.businessOwnerId is number)
+        && (!('businessOwnerName' in data) || (data.businessOwnerName is string && data.businessOwnerName.size() <= 120))
+        && (!('rightsCanReply' in data) || data.rightsCanReply is bool)
+        && (!('rightsCanReadMessages' in data) || data.rightsCanReadMessages is bool)
+        && (!('rightsCanDeleteSent' in data) || data.rightsCanDeleteSent is bool)
+        && (!('lastWebhookAt' in data) || (data.lastWebhookAt is string && data.lastWebhookAt.size() <= 64))
+        && (!('lastWebhookEvent' in data) || (data.lastWebhookEvent is string && data.lastWebhookEvent.size() <= 64))
+        && data.updatedAt == request.time;
+    }
+
+    function isValidChatRule(data) {
+      return data.keys().hasAll(['channel', 'chatId', 'permission', 'updatedAt'])
+        && data.keys().hasOnly([
+          'channel', 'chatId', 'contactName', 'username', 'permission',
+          'aiConsentGranted', 'styleOverride', 'notes', 'lastInboundAt', 'updatedAt'
+        ])
+        && isValidChannel(data.channel)
+        && data.chatId is string && data.chatId.size() >= 1 && data.chatId.size() <= 64
+        && data.chatId.matches('^-?[0-9]+$')
+        && (!('contactName' in data) || (data.contactName is string && data.contactName.size() <= 120))
+        && (!('username' in data) || (data.username is string && data.username.size() <= 64))
+        && data.permission in ['allow', 'manual_approve', 'exclude']
+        && (!('aiConsentGranted' in data) || data.aiConsentGranted is bool)
+        && (!('styleOverride' in data) || (data.styleOverride is string && data.styleOverride.size() <= 1000))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000))
+        && (!('lastInboundAt' in data) || (data.lastInboundAt is string && data.lastInboundAt.size() <= 64))
+        && data.updatedAt == request.time;
+    }
+
+    function isValidMemoryEntry(data) {
+      return data.keys().hasAll(['type', 'scope', 'channel', 'content', 'createdAtMs', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'type', 'scope', 'channel', 'chatId', 'content', 'provenance',
+          'tags', 'expiresAtMs', 'createdAtMs', 'createdAt', 'updatedAt'
+        ])
+        && data.type in ['preference', 'style', 'owner_fact', 'task', 'summary', 'chat_context', 'instruction', 'temp']
+        && data.scope in ['owner', 'chat']
+        && data.channel in ['bot_direct', 'business_chat', 'global']
+        && (!('chatId' in data) || (data.chatId is string && data.chatId.size() <= 64))
+        && data.content is string && data.content.size() >= 1 && data.content.size() <= 1500
+        && (!('provenance' in data) || (data.provenance is string && data.provenance.size() <= 64))
+        && (!('tags' in data) || (data.tags is string && data.tags.size() <= 300))
+        && (!('expiresAtMs' in data) || data.expiresAtMs is number)
+        && data.createdAtMs is number
+        && data.updatedAt == request.time;
+    }
+
+    function isValidPendingApprovalUpdate(data) {
+      return data.keys().hasAll(['chatId', 'draftReply', 'status', 'createdAtMs', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'chatId', 'contactName', 'businessConnectionId', 'replyToMessageId',
+          'incomingText', 'incomingMediaType', 'draftReply', 'escalationReason',
+          'confidenceScore', 'status', 'notificationMessageId', 'createdAtMs', 'createdAt', 'updatedAt'
+        ])
+        && data.chatId is string && data.chatId.size() >= 1 && data.chatId.size() <= 64
+        && data.draftReply is string && data.draftReply.size() <= 4000
+        && (!('confidenceScore' in data) || data.confidenceScore is number)
+        && data.status in ['pending', 'approved', 'rejected', 'expired']
+        && data.updatedAt == request.time;
+    }
+
+    function isValidAuditLogCreate(data) {
+      return data.keys().hasAll(['channel', 'eventType', 'severity', 'summary', 'createdAtMs', 'createdAt'])
+        && data.keys().hasOnly([
+          'channel', 'eventType', 'severity', 'chatId', 'summary', 'details', 'createdAtMs', 'createdAt'
+        ])
+        && data.channel in ['bot_direct', 'business_chat', 'system']
+        && data.eventType is string && data.eventType.size() >= 1 && data.eventType.size() <= 64
+        && data.severity in ['info', 'warn', 'error', 'critical']
+        && (!('chatId' in data) || (data.chatId is string && data.chatId.size() <= 64))
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 500
+        && (!('details' in data) || (data.details is string && data.details.size() <= 2000))
+        && data.createdAtMs is number
+        && data.createdAt == request.time;
+    }
+
+    match /test/connection {
+      allow get: if isOwnerAdmin();
+    }
+
+    match /system/{docId} {
+      allow get: if docId == 'bot_settings' && isOwnerAdmin();
+      allow create, update: if docId == 'bot_settings'
+        && isOwnerAdmin()
+        && isValidBotSettings(incoming());
+    }
+
+    match /chat_rules/{ruleId} {
+      allow get: if isValidId(ruleId) && isOwnerAdmin();
+      allow list: if isOwnerAdmin() && isValidChannel(resource.data.channel);
+      allow create: if isValidId(ruleId)
+        && isOwnerAdmin()
+        && isValidChatRule(incoming());
+      allow update: if isValidId(ruleId)
+        && isOwnerAdmin()
+        && isValidChatRule(incoming())
+        && incoming().channel == existing().channel
+        && incoming().chatId == existing().chatId
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'contactName', 'username', 'permission', 'aiConsentGranted', 'styleOverride', 'notes', 'updatedAt'
+        ]);
+      allow delete: if isValidId(ruleId) && isOwnerAdmin();
+    }
+
+    match /memories/{memoryId} {
+      allow get: if isValidId(memoryId) && isOwnerAdmin();
+      allow list: if isOwnerAdmin() && resource.data.scope in ['owner', 'chat'];
+      allow create: if isValidId(memoryId)
+        && isOwnerAdmin()
+        && isValidMemoryEntry(incoming());
+      allow update: if isValidId(memoryId)
+        && isOwnerAdmin()
+        && isValidMemoryEntry(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().createdAtMs == existing().createdAtMs
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'type', 'scope', 'channel', 'chatId', 'content', 'tags', 'expiresAtMs', 'updatedAt'
+        ]);
+      allow delete: if isValidId(memoryId) && isOwnerAdmin();
+    }
+
+    match /conversations/{convId} {
+      allow get: if isValidId(convId) && isOwnerAdmin();
+      allow list: if isOwnerAdmin() && isValidChannel(resource.data.channel);
+
+      match /messages/{messageId} {
+        allow get: if isValidId(convId) && isValidId(messageId) && isOwnerAdmin();
+        allow list: if isValidId(convId) && isOwnerAdmin() && isValidChannel(resource.data.channel);
+      }
+    }
+
+    match /pending_approvals/{approvalId} {
+      allow get: if isValidId(approvalId) && isOwnerAdmin();
+      allow list: if isOwnerAdmin() && resource.data.status in ['pending', 'approved', 'rejected', 'expired'];
+      allow update: if isValidId(approvalId)
+        && isOwnerAdmin()
+        && existing().status == 'pending'
+        && isValidPendingApprovalUpdate(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().createdAtMs == existing().createdAtMs
+        && incoming().chatId == existing().chatId
+        && incoming().diff(existing()).affectedKeys().hasOnly(['draftReply', 'status', 'updatedAt']);
+    }
+
+    match /audit_logs/{logId} {
+      allow get: if isValidId(logId) && isOwnerAdmin();
+      allow list: if isOwnerAdmin() && resource.data.channel in ['bot_direct', 'business_chat', 'system'];
+      allow create: if isValidId(logId) && isOwnerAdmin() && isValidAuditLogCreate(incoming());
+    }
+
+    // Server-only operational collections (accessed strictly via Firebase Admin SDK IAM)
+    match /user_preferences/{userId} {
+      allow get: if isValidId(userId) && isOwnerAdmin();
+      allow list: if isOwnerAdmin() && resource.data.uiLanguage in ['uz_lat', 'uz_cyr', 'uz_new', 'ru', 'en'];
+    }
+
+    match /message_queue/{jobId} {
+      allow read, write: if false;
+    }
+
+    match /dedup/{dedupId} {
+      allow read, write: if false;
+    }
+  }
+}

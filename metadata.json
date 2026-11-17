@@ -1,0 +1,6 @@
+{
+  "name": "Omnia AI - Personal Telegram Assistant",
+  "description": "Production Telegram Bot & Telegram Business Connected Bot backend powered by Google Gemini on Node.js, TypeScript, and Cloud Run.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
