@@ -4,9 +4,15 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { getGeminiClient } from './ai/brain.ts';
+import { geminiQuotaManager, QuotaUnavailableError } from './ai/geminiQuotaManager.ts';
+import { getGeminiModelSettings } from './ai/modelConfig.ts';
 import type { SpeakingSpeed, TtsVoice, VoiceStyle } from './types.ts';
 
 const execFileAsync = promisify(execFile);
+
+export const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+const FFMPEG_TIMEOUT_MS = 45_000;
+const FFMPEG_MAX_BUFFER = 8 * 1024 * 1024;
 
 const FONT_CANDIDATES = [
   '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
@@ -18,6 +24,15 @@ function resolveFontPath(): string | null {
     if (fs.existsSync(p)) return p;
   }
   return null;
+}
+
+export function validateMediaBuffer(buffer: Buffer, minBytes = 32, maxBytes = MAX_MEDIA_BYTES): void {
+  if (!Buffer.isBuffer(buffer) || buffer.length < minBytes) {
+    throw new Error('Media fayl bo‘sh yoki shikastlangan (juda kichik).');
+  }
+  if (buffer.length > maxBytes) {
+    throw new Error(`Media fayl hajmi ${Math.round(maxBytes / (1024 * 1024))} MB limitidan katta.`);
+  }
 }
 
 export interface MediaProbeInfo {
@@ -33,15 +48,19 @@ export interface MediaProbeInfo {
 
 export async function probeMediaFile(filePath: string): Promise<MediaProbeInfo> {
   const stat = fs.statSync(filePath);
-  const { stdout } = await execFileAsync('ffprobe', [
-    '-v',
-    'error',
-    '-show_entries',
-    'format=duration:stream=codec_type,codec_name,width,height',
-    '-of',
-    'json',
-    filePath,
-  ]);
+  const { stdout } = await execFileAsync(
+    'ffprobe',
+    [
+      '-v',
+      'error',
+      '-show_entries',
+      'format=duration:stream=codec_type,codec_name,width,height',
+      '-of',
+      'json',
+      filePath,
+    ],
+    { timeout: FFMPEG_TIMEOUT_MS, maxBuffer: FFMPEG_MAX_BUFFER }
+  );
 
   const parsed = JSON.parse(stdout) as {
     format?: { duration?: string };
@@ -74,25 +93,31 @@ export async function transcribeAudioBuffer(
   buffer: Buffer,
   mimeType: string = 'audio/ogg'
 ): Promise<string> {
-  if (!buffer || buffer.length < 32) {
-    throw new Error('Audio fayl juda kichik yoki bo‘sh.');
-  }
+  validateMediaBuffer(buffer, 32, MAX_MEDIA_BYTES);
   const ai = getGeminiClient();
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.5-transcribe',
-    contents: {
-      parts: [
-        {
-          inlineData: {
-            mimeType,
-            data: buffer.toString('base64'),
-          },
+  const { transcriptionModel } = getGeminiModelSettings();
+
+  const response = await geminiQuotaManager.execute({
+    task: 'stt',
+    preferredModel: transcriptionModel,
+    allowFallback: true,
+    fn: (model) =>
+      ai.models.generateContent({
+        model,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType,
+                data: buffer.toString('base64'),
+              },
+            },
+            {
+              text: 'Transcribe this speech accurately in its original language and script (supports Uzbek Latin, New Uzbek Latin, Uzbek Cyrillic, Russian, and English). Preserve names and numbers accurately. If audio is silent or unintelligible, return "[silent]". Return only the transcript.',
+            },
+          ],
         },
-        {
-          text: 'Transcribe this speech accurately in its original language and script (supports Uzbek Latin, Uzbek Cyrillic, Russian, and English). Preserve names and numbers accurately. If audio is silent or unintelligible, return "[silent]". Return only the transcript.',
-        },
-      ],
-    },
+      }),
   });
 
   const text = (response.text || '').trim();
@@ -126,27 +151,34 @@ export async function synthesizeVoiceNote(
     throw new Error('TTS uchun matn bo‘sh.');
   }
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash-lite-tts',
-    contents: [
-      {
-        role: 'user',
-        parts: [
+  const { ttsModel } = getGeminiModelSettings();
+  const response = await geminiQuotaManager.execute({
+    task: 'tts',
+    preferredModel: ttsModel,
+    allowFallback: false,
+    fn: (model) =>
+      ai.models.generateContent({
+        model,
+        contents: [
           {
-            text: cleanText,
-            speechMetadata: { style: buildSpeechStyleDirective(voiceStyle, speakingSpeed) },
+            role: 'user',
+            parts: [
+              {
+                text: cleanText,
+                speechMetadata: { style: buildSpeechStyleDirective(voiceStyle, speakingSpeed) },
+              },
+            ],
           },
         ],
-      },
-    ],
-    config: {
-      responseModalities: ['AUDIO'],
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName },
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName },
+            },
+          },
         },
-      },
-    },
+      }),
   });
 
   const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -155,6 +187,8 @@ export async function synthesizeVoiceNote(
   }
 
   const wavBuffer = Buffer.from(base64Audio, 'base64');
+  validateMediaBuffer(wavBuffer, 64, MAX_MEDIA_BYTES);
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omnia_tts_'));
   const wavPath = path.join(tmpDir, 'speech.wav');
   const oggPath = path.join(tmpDir, 'speech.ogg');
@@ -162,22 +196,26 @@ export async function synthesizeVoiceNote(
   try {
     fs.writeFileSync(wavPath, wavBuffer);
     const probe = await probeMediaFile(wavPath);
-    await execFileAsync('ffmpeg', [
-      '-y',
-      '-i',
-      wavPath,
-      '-c:a',
-      'libopus',
-      '-b:a',
-      '32k',
-      '-ar',
-      '48000',
-      '-ac',
-      '1',
-      '-vbr',
-      'on',
-      oggPath,
-    ]);
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        wavPath,
+        '-c:a',
+        'libopus',
+        '-b:a',
+        '32k',
+        '-ar',
+        '48000',
+        '-ac',
+        '1',
+        '-vbr',
+        'on',
+        oggPath,
+      ],
+      { timeout: FFMPEG_TIMEOUT_MS, maxBuffer: FFMPEG_MAX_BUFFER }
+    );
     const oggBuffer = fs.readFileSync(oggPath);
     if (oggBuffer.length < 64) {
       throw new Error('OGG/OPUS konvertatsiyasi bo‘sh natija qaytardi.');
@@ -204,70 +242,90 @@ export async function analyzeVideoWithFfmpeg(params: {
   isVideoNote: boolean;
   caption?: string;
 }): Promise<AnalyzedVideoContext> {
+  validateMediaBuffer(params.videoBuffer, 128, MAX_MEDIA_BYTES);
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omnia_vid_in_'));
   const inputPath = path.join(tmpDir, 'input.mp4');
 
   try {
     fs.writeFileSync(inputPath, params.videoBuffer);
     const probe = await probeMediaFile(inputPath);
-
-    // Extract up to 5 representative keyframes across the duration
-    const frameCount = Math.max(1, Math.min(5, probe.durationSec > 10 ? 5 : 3));
-    const fpsExpr = probe.durationSec > 1 ? `${frameCount}/${Math.max(1, probe.durationSec).toFixed(2)}` : '1';
-    const framePattern = path.join(tmpDir, 'frame_%02d.jpg');
-
-    await execFileAsync('ffmpeg', [
-      '-y',
-      '-i',
-      inputPath,
-      '-vf',
-      `fps=${fpsExpr},scale=640:-2`,
-      '-frames:v',
-      String(frameCount),
-      '-q:v',
-      '3',
-      framePattern,
-    ]);
+    if (!probe.hasVideo && !probe.hasAudio) {
+      throw new Error('Video faylda yaroqli video yoki audio oqim topilmadi.');
+    }
 
     const frames: Array<{ mimeType: 'image/jpeg'; buffer: Buffer; label: string }> = [];
-    const files = fs
-      .readdirSync(tmpDir)
-      .filter((f) => f.startsWith('frame_') && f.endsWith('.jpg'))
-      .sort();
+    if (probe.hasVideo) {
+      const frameCount = Math.max(1, Math.min(5, probe.durationSec > 10 ? 5 : 3));
+      const fpsExpr = probe.durationSec > 1 ? `${frameCount}/${Math.max(1, probe.durationSec).toFixed(2)}` : '1';
+      const framePattern = path.join(tmpDir, 'frame_%02d.jpg');
 
-    for (let i = 0; i < files.length; i++) {
-      const buf = fs.readFileSync(path.join(tmpDir, files[i]));
-      if (buf.length > 0) {
-        frames.push({
-          mimeType: 'image/jpeg',
-          buffer: buf,
-          label: `${params.isVideoNote ? 'video_note' : 'video'} frame ${i + 1}`,
-        });
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          inputPath,
+          '-vf',
+          `fps=${fpsExpr},scale=640:-2`,
+          '-frames:v',
+          String(frameCount),
+          '-q:v',
+          '3',
+          framePattern,
+        ],
+        { timeout: FFMPEG_TIMEOUT_MS, maxBuffer: FFMPEG_MAX_BUFFER }
+      );
+
+      const files = fs
+        .readdirSync(tmpDir)
+        .filter((f) => f.startsWith('frame_') && f.endsWith('.jpg'))
+        .sort();
+
+      for (let i = 0; i < files.length; i++) {
+        const buf = fs.readFileSync(path.join(tmpDir, files[i]));
+        if (buf.length > 0) {
+          frames.push({
+            mimeType: 'image/jpeg',
+            buffer: buf,
+            label: `${params.isVideoNote ? 'video_note' : 'video'} frame ${i + 1}`,
+          });
+        }
       }
     }
 
-    // Extract audio track if present and run speech transcription
     let transcript = '';
     if (probe.hasAudio) {
       const audioPath = path.join(tmpDir, 'audio.ogg');
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-i',
-        inputPath,
-        '-vn',
-        '-c:a',
-        'libopus',
-        '-b:a',
-        '24k',
-        '-ac',
-        '1',
-        audioPath,
-      ]).catch(() => {});
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          inputPath,
+          '-vn',
+          '-c:a',
+          'libopus',
+          '-b:a',
+          '24k',
+          '-ac',
+          '1',
+          audioPath,
+        ],
+        { timeout: FFMPEG_TIMEOUT_MS, maxBuffer: FFMPEG_MAX_BUFFER }
+      ).catch(() => {});
 
       if (fs.existsSync(audioPath)) {
         const audioBuf = fs.readFileSync(audioPath);
         if (audioBuf.length > 200) {
-          transcript = await transcribeAudioBuffer(audioBuf, 'audio/ogg').catch(() => '');
+          try {
+            transcript = await transcribeAudioBuffer(audioBuf, 'audio/ogg');
+          } catch (err) {
+            if (err instanceof QuotaUnavailableError) {
+              throw err;
+            }
+            transcript = '';
+          }
         }
       }
     }
@@ -310,34 +368,38 @@ export async function renderRoundVideoFromAudioFile(params: {
     `[bg][waves]overlay=x=(W-w)/2:y=(H-h)/2+28:shortest=1${drawTextChain},format=yuv420p[vout]`,
   ].join(';');
 
-  await execFileAsync('ffmpeg', [
-    '-y',
-    '-i',
-    params.wavPath,
-    '-filter_complex',
-    filterComplex,
-    '-map',
-    '[vout]',
-    '-map',
-    '0:a',
-    '-t',
-    targetDur.toFixed(2),
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-pix_fmt',
-    'yuv420p',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '64k',
-    '-ar',
-    '44100',
-    '-movflags',
-    '+faststart',
-    params.outputMp4Path,
-  ]);
+  await execFileAsync(
+    'ffmpeg',
+    [
+      '-y',
+      '-i',
+      params.wavPath,
+      '-filter_complex',
+      filterComplex,
+      '-map',
+      '[vout]',
+      '-map',
+      '0:a',
+      '-t',
+      targetDur.toFixed(2),
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '64k',
+      '-ar',
+      '44100',
+      '-movflags',
+      '+faststart',
+      params.outputMp4Path,
+    ],
+    { timeout: FFMPEG_TIMEOUT_MS, maxBuffer: FFMPEG_MAX_BUFFER }
+  );
 
   const outProbe = await probeMediaFile(params.outputMp4Path);
   if (!outProbe.hasVideo || !outProbe.hasAudio || outProbe.width !== 384 || outProbe.height !== 384) {

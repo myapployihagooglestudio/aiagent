@@ -4,6 +4,8 @@ import {
   saveMemorySafely,
   searchMemoryRecords,
 } from './ai/memoryManager.ts';
+import { QuotaUnavailableError } from './ai/geminiQuotaManager.ts';
+import { sanitizeForLog } from './ai/securityFilter.ts';
 import { approveAndSendPendingReply } from './approvals.ts';
 import { buildCallsStatusReport } from './callsAudit.ts';
 import {
@@ -22,6 +24,7 @@ import {
   updateBotSettings,
   updatePendingApproval,
   upsertChatRule,
+  upsertUserProfile,
   writeAuditLog,
 } from './db.ts';
 import { deliverAssistantResponse } from './deliveryHelper.ts';
@@ -40,6 +43,7 @@ import {
   parseLanguageShortcut,
   t,
 } from './i18nBot.ts';
+import { MAX_MEDIA_BYTES } from './mediaPipeline.ts';
 import {
   answerCallbackQuery,
   downloadTelegramFile,
@@ -90,12 +94,12 @@ export interface IncomingTelegramMessage {
   chat: IncomingTelegramChat;
   text?: string;
   caption?: string;
-  voice?: { file_id: string; duration: number; mime_type?: string };
-  audio?: { file_id: string; duration: number; mime_type?: string; file_name?: string };
-  video_note?: { file_id: string; duration: number; length: number };
-  video?: { file_id: string; duration: number; mime_type?: string };
+  voice?: { file_id: string; duration: number; mime_type?: string; file_size?: number };
+  audio?: { file_id: string; duration: number; mime_type?: string; file_name?: string; file_size?: number };
+  video_note?: { file_id: string; duration: number; length: number; file_size?: number };
+  video?: { file_id: string; duration: number; mime_type?: string; file_size?: number };
   photo?: Array<{ file_id: string; file_unique_id: string; width: number; height: number; file_size?: number }>;
-  document?: { file_id: string; file_name?: string; mime_type?: string };
+  document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
 }
 
 export interface IncomingCallbackQuery {
@@ -110,52 +114,56 @@ export interface IncomingCallbackQuery {
   data?: string;
 }
 
+export function evaluateOwnerAccess(params: {
+  userId?: number;
+  isBot?: boolean;
+  envOwnerId: number | null;
+  storedOwnerId: number;
+}): { allowed: boolean; needsOwnerSync: boolean; ownerMissing: boolean } {
+  if (!params.userId || params.isBot) {
+    return { allowed: false, needsOwnerSync: false, ownerMissing: false };
+  }
+  if (params.envOwnerId !== null) {
+    return {
+      allowed: params.userId === params.envOwnerId,
+      needsOwnerSync: params.userId === params.envOwnerId && params.storedOwnerId !== params.envOwnerId,
+      ownerMissing: false,
+    };
+  }
+  if (params.storedOwnerId > 0) {
+    return {
+      allowed: params.userId === params.storedOwnerId,
+      needsOwnerSync: false,
+      ownerMissing: false,
+    };
+  }
+  // Safe locked mode: NEVER allow strangers to claim owner access on /start
+  return { allowed: false, needsOwnerSync: false, ownerMissing: true };
+}
+
 async function resolveOwnerAccess(
-  user: IncomingTelegramUser | undefined,
-  allowClaimOnStart: boolean
-): Promise<{ allowed: boolean; settings: BotSettings; newlyClaimed: boolean }> {
+  user: IncomingTelegramUser | undefined
+): Promise<{ allowed: boolean; settings: BotSettings; ownerMissing: boolean }> {
   let settings = await getBotSettings();
   const envOwner = getBotEnv().ownerUserId;
+  const check = evaluateOwnerAccess({
+    userId: user?.id,
+    isBot: user?.is_bot,
+    envOwnerId: envOwner,
+    storedOwnerId: settings.ownerTelegramId,
+  });
 
-  if (!user || user.is_bot) {
-    return { allowed: false, settings, newlyClaimed: false };
-  }
-
-  if (envOwner !== null) {
-    if (user.id !== envOwner) {
-      return { allowed: false, settings, newlyClaimed: false };
-    }
-    if (settings.ownerTelegramId !== envOwner) {
-      settings = await updateBotSettings({
-        ownerTelegramId: envOwner,
-        ownerUsername: user.username || '',
-      });
-    }
-    return { allowed: true, settings, newlyClaimed: false };
-  }
-
-  if (settings.ownerTelegramId === 0) {
-    if (!allowClaimOnStart) {
-      return { allowed: false, settings, newlyClaimed: false };
-    }
+  if (check.allowed && check.needsOwnerSync && envOwner !== null && user) {
     settings = await updateBotSettings({
-      ownerTelegramId: user.id,
+      ownerTelegramId: envOwner,
       ownerUsername: user.username || '',
     });
-    await writeAuditLog({
-      channel: 'system',
-      eventType: 'owner_bound',
-      severity: 'info',
-      chatId: String(user.id),
-      summary: `Bot egasi Telegram ID ${user.id} (@${user.username || 'noma‘lum'}) ga bog‘landi`,
-    });
-    return { allowed: true, settings, newlyClaimed: true };
   }
 
   return {
-    allowed: user.id === settings.ownerTelegramId,
+    allowed: check.allowed,
     settings,
-    newlyClaimed: false,
+    ownerMissing: check.ownerMissing,
   };
 }
 
@@ -502,19 +510,18 @@ export async function handleBotDirectMessage(msg: IncomingTelegramMessage): Prom
   if (msg.from?.is_bot) return;
 
   const rawText = (msg.text || msg.caption || '').trim();
-  const isStart = /^\/start(@\w+)?(\s|$)/i.test(rawText);
 
   let settings: BotSettings;
   let allowed = false;
-  let newlyClaimed = false;
+  let ownerMissing = false;
 
   try {
-    const access = await resolveOwnerAccess(msg.from, isStart);
+    const access = await resolveOwnerAccess(msg.from);
     allowed = access.allowed;
     settings = access.settings;
-    newlyClaimed = access.newlyClaimed;
+    ownerMissing = access.ownerMissing;
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
+    const errMsg = sanitizeForLog(err instanceof Error ? err.message : String(err));
     await sendBotTextMessage({
       chatId: msg.chat.id,
       text: `⚠️ Ma’lumotlar bazasi (Firestore) hozircha javob bermayapti:\n${errMsg.slice(0, 350)}`,
@@ -525,16 +532,29 @@ export async function handleBotDirectMessage(msg: IncomingTelegramMessage): Prom
   if (!allowed) {
     await writeAuditLog({
       channel: 'bot_direct',
-      eventType: 'unauthorized_bot_access',
-      severity: 'warn',
+      eventType: ownerMissing ? 'owner_not_configured' : 'unauthorized_bot_access',
+      severity: ownerMissing ? 'critical' : 'warn',
       chatId: String(msg.chat.id),
-      summary: `Ruxsatsiz foydalanuvchi ${msg.from?.id ?? 'unknown'} shaxsiy botga kirishga urindi`,
+      summary: ownerMissing
+        ? `TELEGRAM_OWNER_USER_ID sozlanmagan; ${msg.from?.id ?? 'unknown'} so‘rovi bloklandi`
+        : `Ruxsatsiz foydalanuvchi ${msg.from?.id ?? 'unknown'} shaxsiy botga kirishga urindi`,
     }).catch(() => {});
     await sendBotTextMessage({
       chatId: msg.chat.id,
-      text: t(settings.uiLanguage).unauthorized,
+      text: ownerMissing
+        ? '🔒 Bot xavfsizlik rejimida: serverda TELEGRAM_OWNER_USER_ID hali sozlanmagan. Avval server muhitiga egasi Telegram ID sini kiriting.'
+        : t(settings.uiLanguage).unauthorized,
     }).catch(() => {});
     return;
+  }
+
+  if (msg.from?.id) {
+    void upsertUserProfile({
+      userId: String(msg.from.id),
+      channel: 'bot_direct',
+      username: msg.from.username || '',
+      displayName: `${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim(),
+    }).catch(() => {});
   }
 
   const s = t(settings.uiLanguage);
@@ -546,12 +566,9 @@ export async function handleBotDirectMessage(msg: IncomingTelegramMessage): Prom
     const argLower = argText.toLowerCase();
 
     if (cmd === '/start') {
-      const claimNote = newlyClaimed
-        ? `\n\n🔐 Egasi Telegram ID (${msg.from?.id}) ga bog‘landi.`
-        : '';
       await sendBotTextMessage({
         chatId: msg.chat.id,
-        text: `${s.welcomeTitle}\n\n${s.welcomeBody}${claimNote}`,
+        text: `${s.welcomeTitle}\n\n${s.welcomeBody}`,
         replyMarkup: buildMainMenuKeyboard(settings.uiLanguage, settings),
       });
       return;
@@ -1118,7 +1135,14 @@ export async function handleBotDirectMessage(msg: IncomingTelegramMessage): Prom
       attachments.push({ mimeType: 'image/jpeg', buffer, label: 'photo' });
     } else if (msg.document) {
       mediaType = 'document';
-      const supported = ['application/pdf', 'text/plain', 'image/png', 'image/jpeg'];
+      const supported = ['application/pdf', 'text/plain', 'image/png', 'image/jpeg', 'image/webp'];
+      if (msg.document.file_size && msg.document.file_size > MAX_MEDIA_BYTES) {
+        await sendBotTextMessage({
+          chatId: msg.chat.id,
+          text: `⚠️ Fayl hajmi 20 MB limitidan katta (${Math.round(msg.document.file_size / (1024 * 1024))} MB); Telegram Bot API uni yuklab ololmaydi.`,
+        });
+        return;
+      }
       if (msg.document.mime_type && supported.includes(msg.document.mime_type)) {
         const { buffer } = await downloadTelegramFile(msg.document.file_id);
         attachments.push({
@@ -1127,7 +1151,7 @@ export async function handleBotDirectMessage(msg: IncomingTelegramMessage): Prom
           label: `document (${msg.document.file_name || 'file'})`,
         });
       } else {
-        inboundText = `${inboundText} [Fayl: ${msg.document.file_name || 'hujjat'}]`.trim();
+        inboundText = `${inboundText} [Qo‘llab-quvvatlanmaydigan fayl turi: ${msg.document.file_name || 'hujjat'} (${msg.document.mime_type || 'noma‘lum'})]`.trim();
       }
     }
 
@@ -1164,6 +1188,7 @@ export async function handleBotDirectMessage(msg: IncomingTelegramMessage): Prom
       conversationHistory: history,
       inboundText: inboundText || `[${mediaType}]`,
       attachments: attachments.length > 0 ? attachments : undefined,
+      dedupKey: `bot_${chatIdStr}_${msg.message_id}`,
     });
 
     const replyText = reply.replyText || 'Javob shakllantirilmadi.';
@@ -1194,18 +1219,30 @@ export async function handleBotDirectMessage(msg: IncomingTelegramMessage): Prom
       details: delivered.fallbackNote || '',
     });
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
+    const rawErr = err instanceof Error ? err.message : String(err);
+    const safeErr = sanitizeForLog(rawErr);
+
     await writeAuditLog({
       channel: 'bot_direct',
-      eventType: 'bot_direct_error',
-      severity: 'error',
+      eventType: err instanceof QuotaUnavailableError ? 'gemini_quota_unavailable' : 'bot_direct_error',
+      severity: err instanceof QuotaUnavailableError ? 'warn' : 'error',
       chatId: chatIdStr,
-      summary: 'B komponent javob yaratishda xatolik',
-      details: errMsg,
+      summary: err instanceof QuotaUnavailableError ? 'Gemini API kvotasi vaqtincha band' : 'B komponent javob yaratishda xatolik',
+      details: safeErr,
     }).catch(() => {});
+
+    if (err instanceof QuotaUnavailableError) {
+      const waitSec = Math.max(5, Math.ceil(err.retryAfterMs / 1000));
+      await sendBotTextMessage({
+        chatId: msg.chat.id,
+        text: `⏳ Gemini AI xizmati hozir vaqtincha cheklangan (${waitSec} soniyadan so‘ng qayta urinib ko‘ring). Xabaringiz xavfsizlik tekshiruviga tushmadi — bu vaqtinchalik API limiti.`,
+      }).catch(() => {});
+      return;
+    }
+
     await sendBotTextMessage({
       chatId: msg.chat.id,
-      text: `⚠️ Xatolik yuz berdi: ${errMsg.slice(0, 400)}`,
+      text: `⚠️ Xatolik yuz berdi: ${safeErr.slice(0, 350)}`,
     }).catch(() => {});
   }
 }
@@ -1215,7 +1252,7 @@ export async function handleBotCallbackQuery(cb: IncomingCallbackQuery): Promise
   const chatId = cb.message?.chat.id ?? cb.from.id;
   const messageId = cb.message?.message_id;
 
-  const { allowed, settings: currentSettings } = await resolveOwnerAccess(cb.from, false);
+  const { allowed, settings: currentSettings } = await resolveOwnerAccess(cb.from);
   let settings = currentSettings;
   const s = t(settings.uiLanguage);
 

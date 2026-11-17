@@ -6,7 +6,7 @@ import {
   searchMemoryRecords,
 } from '../db.ts';
 import type { ChatChannel, MemoryEntry, MemoryScope, MemoryType } from '../types.ts';
-import { containsSensitiveSecret } from './securityFilter.ts';
+import { containsSensitiveSecret, sanitizeMemoryTextForPrompt } from './securityFilter.ts';
 
 function tokenize(text: string): string[] {
   return text
@@ -21,9 +21,11 @@ export async function retrieveRelevantMemories(params: {
   queryText: string;
   legacyMemorySummary?: string;
   limit?: number;
-}): Promise<{ entries: MemoryEntry[]; formattedContext: string }> {
+}): Promise<{ entries: MemoryEntry[]; formattedContext: string; loadError: boolean }> {
   const limit = params.limit ?? 10;
   let scoped: MemoryEntry[] = [];
+  let loadError = false;
+
   try {
     scoped = await listScopedMemories({
       channel: params.channel,
@@ -32,11 +34,17 @@ export async function retrieveRelevantMemories(params: {
     });
   } catch {
     scoped = [];
+    loadError = true;
   }
 
-  // Strict cross-chat isolation filter in memory too (belt-and-suspenders)
+  // Strict cross-chat and owner-privacy isolation filter:
+  // Owner-scoped memories are available ONLY in bot_direct (owner private channel), NEVER in business_chat.
   const isolated = scoped.filter((m) => {
-    if (m.scope === 'owner') return true;
+    if (!m || typeof m.content !== 'string' || !m.content.trim()) return false;
+    if (m.expiresAtMs > 0 && m.expiresAtMs <= Date.now()) return false;
+    if (m.scope === 'owner') {
+      return params.channel === 'bot_direct';
+    }
     return m.scope === 'chat' && m.channel === params.channel && m.chatId === params.chatId;
   });
 
@@ -60,17 +68,23 @@ export async function retrieveRelevantMemories(params: {
     .map((r) => r.entry);
 
   const lines: string[] = [];
-  if (params.legacyMemorySummary?.trim()) {
-    lines.push(`[Owner Global Notes]\n${params.legacyMemorySummary.trim()}`);
+  if (params.channel === 'bot_direct' && params.legacyMemorySummary?.trim()) {
+    const safeLegacy = sanitizeMemoryTextForPrompt(params.legacyMemorySummary.trim());
+    if (safeLegacy) {
+      lines.push(`[Owner Global Notes]\n${safeLegacy}`);
+    }
   }
   for (const m of ranked) {
+    const safeContent = sanitizeMemoryTextForPrompt(m.content);
+    if (!safeContent) continue;
     const scopeLabel = m.scope === 'owner' ? 'owner' : `chat:${m.chatId}`;
-    lines.push(`[${m.type}/${scopeLabel}] ${m.content}`);
+    lines.push(`[${m.type}/${scopeLabel}] ${safeContent}`);
   }
 
   return {
     entries: ranked,
     formattedContext: lines.join('\n'),
+    loadError,
   };
 }
 

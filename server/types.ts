@@ -20,6 +20,18 @@ export interface UserLanguagePreference {
   updatedAt: string;
 }
 
+export interface UserProfile {
+  userId: string;
+  channel: ChatChannel;
+  username: string;
+  displayName: string;
+  languageCode: string;
+  messageCount: number;
+  lastSeenAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type MemoryType =
   | 'preference'
   | 'style'
@@ -155,6 +167,12 @@ export interface QueueJob {
   payloadJson: string;
   status: 'queued' | 'processing' | 'done' | 'dead_letter';
   attempts: number;
+  workerId: string;
+  leaseExpiresAtMs: number;
+  nextAttemptAtMs: number;
+  deliveryState: 'pending' | 'delivered' | 'uncertain';
+  sentTelegramMessageId: number;
+  sentMediaType: string;
   lastError: string;
   createdAtMs: number;
   createdAt: string;

@@ -95,6 +95,12 @@ export function getBotEnv(): BotEnvConfig {
   };
 }
 
+let cachedBotId: number | null = null;
+
+export function getCachedBotId(): number | null {
+  return cachedBotId;
+}
+
 export function verifyWebhookSecretHeader(receivedHeader: string | undefined): boolean {
   const { webhookSecret } = getBotEnv();
   if (!webhookSecret || !receivedHeader) return false;
@@ -105,7 +111,7 @@ export function verifyWebhookSecretHeader(receivedHeader: string | undefined): b
   return crypto.timingSafeEqual(expectedBuf, receivedBuf);
 }
 
-async function callTelegramApi<T>(method: string, body?: Record<string, unknown>): Promise<T> {
+async function callTelegramApi<T>(method: string, body?: Record<string, unknown>, retryAttempt = 0): Promise<T> {
   const { token } = getBotEnv();
   if (!token) {
     throw new Error('TELEGRAM_BOT_TOKEN server maxfiy kalitlarda sozlanmagan.');
@@ -115,6 +121,7 @@ async function callTelegramApi<T>(method: string, body?: Record<string, unknown>
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(15_000),
   });
 
   const data = (await res.json()) as {
@@ -122,7 +129,17 @@ async function callTelegramApi<T>(method: string, body?: Record<string, unknown>
     result?: T;
     description?: string;
     error_code?: number;
+    parameters?: { retry_after?: number };
   };
+
+  if (res.status === 429 && retryAttempt === 0) {
+    const retryAfterSec = Number(data.parameters?.retry_after || 0);
+    if (Number.isFinite(retryAfterSec) && retryAfterSec > 0 && retryAfterSec <= 10) {
+      await new Promise((r) => setTimeout(r, retryAfterSec * 1000 + 150));
+      return callTelegramApi<T>(method, body, 1);
+    }
+  }
+
   if (!res.ok || !data.ok || data.result === undefined) {
     throw new Error(data.description || `Telegram API error (${res.status}) calling ${method}`);
   }
@@ -150,6 +167,7 @@ export async function getLiveBotStatus(): Promise<TelegramLiveStatus> {
       callTelegramApi<TelegramWebhookInfo>('getWebhookInfo'),
     ]);
 
+    cachedBotId = me.id;
     status.botInfo = {
       id: me.id,
       username: me.username,
@@ -191,6 +209,7 @@ export async function registerTelegramWebhook(baseUrl: string): Promise<{
   const normalizedBase = baseUrl.replace(/\/+$/, '');
   const webhookUrl = `${normalizedBase}/telegram/webhook`;
   const me = await callTelegramApi<TelegramBotMe>('getMe');
+  cachedBotId = me.id;
 
   await callTelegramApi<boolean>('setWebhook', {
     url: webhookUrl,
@@ -318,6 +337,7 @@ export async function sendBotVoiceMessage(params: {
   const res = await fetch(`${TELEGRAM_API_BASE}/bot${token}/sendVoice`, {
     method: 'POST',
     body: form,
+    signal: AbortSignal.timeout(30_000),
   });
 
   const data = (await res.json()) as {
@@ -360,6 +380,7 @@ export async function sendBotVideoNote(params: {
   const res = await fetch(`${TELEGRAM_API_BASE}/bot${token}/sendVideoNote`, {
     method: 'POST',
     body: form,
+    signal: AbortSignal.timeout(30_000),
   });
 
   const data = (await res.json()) as {
@@ -430,7 +451,9 @@ export async function downloadTelegramFile(
     throw new Error('Telegram getFile javobida file_path qaytmadi.');
   }
 
-  const downloadRes = await fetch(`${TELEGRAM_API_BASE}/file/bot${token}/${fileInfo.file_path}`);
+  const downloadRes = await fetch(`${TELEGRAM_API_BASE}/file/bot${token}/${fileInfo.file_path}`, {
+    signal: AbortSignal.timeout(30_000),
+  });
   if (!downloadRes.ok) {
     throw new Error(`Telegram media yuklab olinmadi (${downloadRes.status}).`);
   }

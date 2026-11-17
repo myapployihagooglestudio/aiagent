@@ -167,7 +167,7 @@
     },
     "MessageQueueJob": {
       "title": "MessageQueueJob",
-      "description": "Server-only persistent message-processing queue item.",
+      "description": "Server-only persistent message-processing queue item with atomic lease lock and delivery checkpoint.",
       "type": "object",
       "properties": {
         "channel": { "type": "string", "enum": ["bot_direct", "business_chat"], "maxLength": 24 },
@@ -176,12 +176,35 @@
         "payloadJson": { "type": "string", "maxLength": 32000 },
         "status": { "type": "string", "enum": ["queued", "processing", "done", "dead_letter"], "maxLength": 20 },
         "attempts": { "type": "number" },
+        "workerId": { "type": "string", "maxLength": 64 },
+        "leaseExpiresAtMs": { "type": "number" },
+        "nextAttemptAtMs": { "type": "number" },
+        "deliveryState": { "type": "string", "enum": ["pending", "delivered", "uncertain"], "maxLength": 16 },
+        "sentTelegramMessageId": { "type": "number" },
+        "sentMediaType": { "type": "string", "maxLength": 24 },
         "lastError": { "type": "string", "maxLength": 1000 },
         "createdAtMs": { "type": "number" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["channel", "chatId", "messageId", "payloadJson", "status", "attempts", "createdAtMs", "createdAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Isolated per-Telegram-user profile metadata stored separately from owner global settings.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[0-9]+$" },
+        "channel": { "type": "string", "enum": ["bot_direct", "business_chat"], "maxLength": 24 },
+        "username": { "type": "string", "maxLength": 64 },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "languageCode": { "type": "string", "maxLength": 16 },
+        "messageCount": { "type": "number" },
+        "lastSeenAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "channel", "messageCount", "lastSeenAt", "createdAt", "updatedAt"]
     },
     "UserLanguagePreference": {
       "title": "UserLanguagePreference",
@@ -216,6 +239,10 @@
     "/user_preferences/{userId}": {
       "schema": { "$ref": "#/entities/UserLanguagePreference" },
       "description": "Persistent per-user language preference keyed by Telegram user ID."
+    },
+    "/user_profiles/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Isolated per-Telegram-user profile metadata keyed by numeric userId."
     },
     "/chat_rules/{ruleId}": {
       "schema": { "$ref": "#/entities/ChatRule" },

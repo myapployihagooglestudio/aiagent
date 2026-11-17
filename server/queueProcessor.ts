@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import {
   handleBotCallbackQuery,
   handleBotDirectMessage,
@@ -6,22 +7,27 @@ import {
   type IncomingTelegramMessage,
   type IncomingTelegramUser,
 } from './botCommands.ts';
+import { QuotaUnavailableError } from './ai/geminiQuotaManager.ts';
+import { sanitizeForLog } from './ai/securityFilter.ts';
 import {
   addConversationMessage,
   claimDedupKey,
+  claimQueuedJobs,
   createPendingApproval,
   enqueueJob,
-  fetchQueuedJobs,
   getBotSettings,
   getChatRule,
   getConversationHistory,
   getUserLanguagePreference,
+  markQueueJobDelivered,
+  scheduleQueueJobRetry,
   setUserLanguagePreference,
   updateBotSettings,
   updateMessageStatusByTelegramId,
   updatePendingApproval,
   updateQueueJobStatus,
   upsertChatRule,
+  upsertUserProfile,
   writeAuditLog,
 } from './db.ts';
 import { deliverAssistantResponse } from './deliveryHelper.ts';
@@ -37,15 +43,17 @@ import {
   parseLanguageShortcut,
   t,
 } from './i18nBot.ts';
+import { MAX_MEDIA_BYTES } from './mediaPipeline.ts';
 import {
   downloadTelegramFile,
   getBotEnv,
+  getCachedBotId,
   markBusinessMessageRead,
   sendBotTextMessage,
   sendBusinessTextMessage,
   type TelegramBusinessConnectionPayload,
 } from './telegramClient.ts';
-import type { UILanguage } from './types.ts';
+import type { QueueJob, UILanguage } from './types.ts';
 
 export interface TelegramUpdatePayload {
   update_id: number;
@@ -61,9 +69,11 @@ export interface TelegramUpdatePayload {
   callback_query?: IncomingCallbackQuery;
 }
 
+const WORKER_ID = `worker_${process.pid}_${crypto.randomBytes(3).toString('hex')}`;
 const outboundTimestamps: number[] = [];
 let workerLoopTimer: NodeJS.Timeout | null = null;
-let isProcessingQueue = false;
+let activeDrainPromise: Promise<void> | null = null;
+let isShuttingDown = false;
 
 function formatContactName(chat: IncomingTelegramChat, from?: IncomingTelegramUser): string {
   const first = chat.first_name || from?.first_name || '';
@@ -115,15 +125,15 @@ export async function handleTelegramWebhookUpdate(update: TelegramUpdatePayload)
   if (update.business_connection) {
     const bc = update.business_connection;
     const settings = await getBotSettings();
-    const expectedOwner = getBotEnv().ownerUserId ?? (settings.ownerTelegramId || null);
+    const expectedOwner = getBotEnv().ownerUserId ?? (settings.ownerTelegramId > 0 ? settings.ownerTelegramId : null);
 
-    if (expectedOwner !== null && expectedOwner !== 0 && bc.user.id !== expectedOwner) {
+    if (expectedOwner === null || bc.user.id !== expectedOwner) {
       await writeAuditLog({
         channel: 'business_chat',
         eventType: 'unauthorized_business_connection',
         severity: 'critical',
         summary: `Kutilmagan foydalanuvchi (${bc.user.id}) dan business_connection rad etildi`,
-        details: `Kutilgan egasi ${expectedOwner}, kelgan ID ${bc.user.id}`,
+        details: `Kutilgan egasi ${expectedOwner ?? 'sozlanmagan'}, kelgan ID ${bc.user.id}`,
       });
       return;
     }
@@ -141,7 +151,6 @@ export async function handleTelegramWebhookUpdate(update: TelegramUpdatePayload)
       rightsCanReply: canReply,
       rightsCanReadMessages: canRead,
       rightsCanDeleteSent: canDeleteSent,
-      ...(settings.ownerTelegramId === 0 ? { ownerTelegramId: bc.user.id } : {}),
     });
 
     await writeAuditLog({
@@ -200,9 +209,11 @@ export async function handleTelegramWebhookUpdate(update: TelegramUpdatePayload)
   if (update.business_message) {
     const msg = update.business_message;
     const chatId = String(msg.chat.id);
+    const botSelfId = getCachedBotId();
 
     if (msg.chat.type !== 'private') return;
     if (msg.from?.is_bot || msg.sender_business_bot) return;
+    if (botSelfId !== null && msg.from?.id === botSelfId) return;
 
     const settings = await getBotSettings();
     if (settings.businessOwnerId && msg.from?.id === settings.businessOwnerId) {
@@ -286,11 +297,25 @@ async function notifyOwnerOfPendingApproval(params: {
   }
 }
 
-async function processQueuedBusinessJob(msg: IncomingTelegramMessage): Promise<void> {
+async function processQueuedBusinessJob(job: QueueJob, msg: IncomingTelegramMessage): Promise<void> {
+  if (job.deliveryState === 'delivered' && job.sentTelegramMessageId > 0) {
+    // Already delivered in a previous worker attempt before post-send metadata finished; do not double-send!
+    return;
+  }
+
   const chatId = String(msg.chat.id);
   const contactName = formatContactName(msg.chat, msg.from);
   const mediaType = detectMediaType(msg);
   const settings = await getBotSettings();
+
+  if (msg.from?.id) {
+    void upsertUserProfile({
+      userId: String(msg.from.id),
+      channel: 'business_chat',
+      username: msg.from.username || msg.chat.username || '',
+      displayName: contactName,
+    }).catch(() => {});
+  }
 
   const existingRule = await getChatRule('business_chat', chatId);
   if (existingRule?.permission === 'exclude') {
@@ -447,8 +472,10 @@ async function processQueuedBusinessJob(msg: IncomingTelegramMessage): Promise<v
     inboundText = analyzed.summaryContext;
     for (const fr of analyzed.frames) attachments.push(fr);
   } else if (mediaType === 'document' && msg.document) {
-    const supported = ['application/pdf', 'text/plain', 'image/png', 'image/jpeg'];
-    if (msg.document.mime_type && supported.includes(msg.document.mime_type)) {
+    const supported = ['application/pdf', 'text/plain', 'image/png', 'image/jpeg', 'image/webp'];
+    if (msg.document.file_size && msg.document.file_size > MAX_MEDIA_BYTES) {
+      inboundText = `${inboundText} [Fayl hajmi 20 MB limitidan katta: ${msg.document.file_name || 'hujjat'}]`.trim();
+    } else if (msg.document.mime_type && supported.includes(msg.document.mime_type)) {
       const { buffer } = await downloadTelegramFile(msg.document.file_id);
       attachments.push({
         mimeType: msg.document.mime_type,
@@ -456,7 +483,7 @@ async function processQueuedBusinessJob(msg: IncomingTelegramMessage): Promise<v
         label: `document (${msg.document.file_name || 'file'})`,
       });
     } else {
-      inboundText = `${inboundText} [Fayl: ${msg.document.file_name || 'hujjat'}]`.trim();
+      inboundText = `${inboundText} [Qo‘llab-quvvatlanmaydigan fayl: ${msg.document.file_name || 'hujjat'}]`.trim();
     }
   }
 
@@ -509,9 +536,12 @@ async function processQueuedBusinessJob(msg: IncomingTelegramMessage): Promise<v
     conversationHistory: history,
     inboundText: inboundText || `[${mediaType}]`,
     attachments: attachments.length > 0 ? attachments : undefined,
+    dedupKey: `bjob_${job.id}`,
   });
 
-  const lowConfidence = draft.confidenceScore < settings.confidenceThreshold;
+  const qcLowConfidence =
+    (draft.verifiedByModel && draft.confidenceScore < settings.confidenceThreshold) ||
+    (!draft.qcError && !draft.qcPassed);
   const businessConnectionId = msg.business_connection_id || settings.businessConnectionId;
 
   // AUTONOMOUS BY DEFAULT: only escalate when manual mode is explicitly chosen OR genuine risk/low-confidence triggers
@@ -521,11 +551,11 @@ async function processQueuedBusinessJob(msg: IncomingTelegramMessage): Promise<v
     existingRule?.permission === 'manual_approve' ||
     draft.safetyBlocked ||
     draft.shouldEscalate ||
-    lowConfidence;
+    qcLowConfidence;
 
   const reasonLabel = draft.safetyBlocked
     ? draft.escalationReason || 'Xavfsizlik / moliyaviy cheklov'
-    : lowConfidence
+    : qcLowConfidence
       ? `Past ishonchlilik (${draft.confidenceScore}% < ${settings.confidenceThreshold}%)`
       : draft.shouldEscalate
         ? draft.escalationReason || 'Egasi tasdig‘i talab qilinadi'
@@ -596,6 +626,12 @@ async function processQueuedBusinessJob(msg: IncomingTelegramMessage): Promise<v
     replyToMessageId: msg.message_id,
   });
 
+  // Immediately checkpoint delivery BEFORE writing secondary conversation/audit metadata to prevent duplicate sends
+  await markQueueJobDelivered(job.id, {
+    sentTelegramMessageId: delivered.sentMessageId,
+    sentMediaType: delivered.mediaType,
+  });
+
   await addConversationMessage({
     channel: 'business_chat',
     chatId,
@@ -617,55 +653,99 @@ async function processQueuedBusinessJob(msg: IncomingTelegramMessage): Promise<v
 }
 
 export async function drainMessageQueue(): Promise<void> {
-  if (isProcessingQueue) return;
-  isProcessingQueue = true;
-
-  try {
-    const jobs = await fetchQueuedJobs(10);
-    for (const job of jobs) {
-      const nextAttempts = job.attempts + 1;
-      await updateQueueJobStatus(job.id, { status: 'processing', attempts: nextAttempts });
-
-      try {
-        const msg = JSON.parse(job.payloadJson) as IncomingTelegramMessage;
-        await processQueuedBusinessJob(msg);
-        await updateQueueJobStatus(job.id, { status: 'done' });
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        const terminal = nextAttempts >= 3;
-        await updateQueueJobStatus(job.id, {
-          status: terminal ? 'dead_letter' : 'queued',
-          lastError: errMsg,
-        });
-        await writeAuditLog({
-          channel: job.channel,
-          eventType: terminal ? 'queue_dead_letter' : 'queue_retry',
-          severity: 'error',
-          chatId: job.chatId,
-          summary: terminal
-            ? `${job.messageId}-xabar 3 urinishdan so‘ng dead_letter ga o‘tdi`
-            : `${job.messageId}-xabar qayta urinish #${nextAttempts}`,
-          details: errMsg,
-        }).catch(() => {});
-      }
-    }
-  } catch (err) {
-    console.warn('[QueueWorker] Error:', err instanceof Error ? err.message : err);
-  } finally {
-    isProcessingQueue = false;
+  if (activeDrainPromise || isShuttingDown) {
+    return activeDrainPromise ?? undefined;
   }
+
+  const run = (async () => {
+    try {
+      const jobs = await claimQueuedJobs({
+        workerId: WORKER_ID,
+        limit: 5,
+        leaseDurationMs: 90_000,
+      });
+
+      for (const job of jobs) {
+        if (isShuttingDown) break;
+        try {
+          const msg = JSON.parse(job.payloadJson) as IncomingTelegramMessage;
+          await processQueuedBusinessJob(job, msg);
+          await updateQueueJobStatus(job.id, { status: 'done' });
+        } catch (err) {
+          const rawErr = err instanceof Error ? err.message : String(err);
+          const safeErr = sanitizeForLog(rawErr);
+
+          if (err instanceof QuotaUnavailableError && job.attempts < 10) {
+            const backoffMs = Math.min(Math.max(err.retryAfterMs, 10_000), 15 * 60_000);
+            await scheduleQueueJobRetry(job.id, {
+              attempts: job.attempts,
+              nextAttemptAtMs: Date.now() + backoffMs,
+              lastError: safeErr,
+            });
+            await writeAuditLog({
+              channel: job.channel,
+              eventType: 'queue_quota_backoff',
+              severity: 'warn',
+              chatId: job.chatId,
+              summary: `${job.messageId}-xabar API kvota/Retry-After sabab ${Math.ceil(backoffMs / 1000)}s ga navbatda saqlandi (#${job.attempts})`,
+              details: safeErr,
+            }).catch(() => {});
+            continue;
+          }
+
+          const terminal = job.attempts >= 3;
+          if (terminal) {
+            await updateQueueJobStatus(job.id, {
+              status: 'dead_letter',
+              lastError: safeErr,
+            });
+          } else {
+            const backoffMs = 10_000 * job.attempts;
+            await scheduleQueueJobRetry(job.id, {
+              attempts: job.attempts,
+              nextAttemptAtMs: Date.now() + backoffMs,
+              lastError: safeErr,
+            });
+          }
+
+          await writeAuditLog({
+            channel: job.channel,
+            eventType: terminal ? 'queue_dead_letter' : 'queue_retry',
+            severity: 'error',
+            chatId: job.chatId,
+            summary: terminal
+              ? `${job.messageId}-xabar ${job.attempts} urinishdan so‘ng dead_letter ga o‘tdi`
+              : `${job.messageId}-xabar qayta urinish #${job.attempts}`,
+            details: safeErr,
+          }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.warn('[QueueWorker] Error:', sanitizeForLog(err instanceof Error ? err.message : String(err)));
+    } finally {
+      activeDrainPromise = null;
+    }
+  })();
+
+  activeDrainPromise = run;
+  return run;
 }
 
 export function startQueueWorker(): void {
+  isShuttingDown = false;
   if (workerLoopTimer) return;
   workerLoopTimer = setInterval(() => {
     void drainMessageQueue();
   }, 5000);
 }
 
-export function stopQueueWorker(): void {
+export async function stopQueueWorker(): Promise<void> {
+  isShuttingDown = true;
   if (workerLoopTimer) {
     clearInterval(workerLoopTimer);
     workerLoopTimer = null;
+  }
+  if (activeDrainPromise) {
+    await activeDrainPromise.catch(() => {});
   }
 }

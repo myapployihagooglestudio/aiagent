@@ -9,6 +9,14 @@
       ]
     },
     {
+      "collectionGroup": "message_queue",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "leaseExpiresAtMs", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "pending_approvals",
       "queryScope": "COLLECTION",
       "fields": [

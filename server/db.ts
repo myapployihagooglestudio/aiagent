@@ -1,5 +1,5 @@
-import { applicationDefault, getApps, initializeApp, type App } from 'firebase-admin/app';
-import { getFirestore, type Firestore } from 'firebase-admin/firestore';
+import { applicationDefault, cert, getApps, initializeApp, type App, type ServiceAccount } from 'firebase-admin/app';
+import { FieldValue, getFirestore, type Firestore } from 'firebase-admin/firestore';
 import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
 import { containsSensitiveSecret, sanitizeForLog } from './ai/securityFilter.ts';
 import type {
@@ -16,23 +16,66 @@ import type {
   QueueJob,
   UILanguage,
   UserLanguagePreference,
+  UserProfile,
 } from './types.ts';
+
+function isTransientFirestoreError(err: unknown): boolean {
+  const code = (err as { code?: number | string })?.code;
+  if (code === 14 || code === 10 || code === 4 || code === 8) return true;
+  if (
+    code === 'UNAVAILABLE' ||
+    code === 'ABORTED' ||
+    code === 'DEADLINE_EXCEEDED' ||
+    code === 'RESOURCE_EXHAUSTED'
+  ) {
+    return true;
+  }
+  const msg = (err instanceof Error ? err.message : String(err)).toUpperCase();
+  return (
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('ABORTED') ||
+    msg.includes('DEADLINE_EXCEEDED') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('ECONNRESET')
+  );
+}
+
+export async function withFirestoreRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientFirestoreError(err) || attempt >= maxAttempts) {
+        throw err;
+      }
+      const delayMs = 200 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 120);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
 
 const DEFAULT_PERSONA =
   "Siz OMNIA AI — egangizning shaxsiy Telegram yordamchisisiz. Murojaat tiliga mos ravishda (o'zbekcha lotin, o'zbekcha kirill, ruscha yoki inglizcha) aniq, madaniyatli, tabiiy va professional javob bering. Bilmagan ma'lumotingizni aslo to'qib chiqarmang.";
 
 let firebaseApp: App | null = null;
 let firestoreDb: Firestore | null = null;
+let credentialSource: 'service_account_json' | 'adc' = 'adc';
+let configuredServiceAccountEmail: string | null = null;
 let lastProbeStatus: {
   connected: boolean;
   checkedAt: string | null;
   error: string | null;
   serviceAccount: string | null;
+  remediation: string | null;
 } = {
   connected: false,
   checkedAt: null,
   error: 'Not probed yet',
   serviceAccount: null,
+  remediation: null,
 };
 
 function nowIso(): string {
@@ -85,13 +128,40 @@ export function defaultBotSettings(): BotSettings {
   };
 }
 
+function parseServiceAccountFromEnv(): ServiceAccount | null {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  if (!raw) return null;
+  try {
+    const jsonText = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+    const parsed = JSON.parse(jsonText) as ServiceAccount & { client_email?: string; private_key?: string };
+    if (parsed && (parsed.privateKey || parsed.private_key) && (parsed.clientEmail || parsed.client_email)) {
+      return parsed;
+    }
+  } catch {
+    console.warn('[Omnia AI] FIREBASE_SERVICE_ACCOUNT_JSON could not be parsed; falling back to ADC.');
+  }
+  return null;
+}
+
 function getFirestoreClient(): Firestore {
   if (firestoreDb) return firestoreDb;
+  const sa = parseServiceAccountFromEnv();
+  if (sa) {
+    credentialSource = 'service_account_json';
+    configuredServiceAccountEmail =
+      (sa as { clientEmail?: string; client_email?: string }).clientEmail ||
+      (sa as { client_email?: string }).client_email ||
+      null;
+  } else {
+    credentialSource = 'adc';
+    configuredServiceAccountEmail = null;
+  }
+
   firebaseApp =
     getApps().length > 0
       ? getApps()[0]
       : initializeApp({
-          credential: applicationDefault(),
+          credential: sa ? cert(sa) : applicationDefault(),
           projectId: firebaseConfig.projectId,
         });
   firestoreDb = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
@@ -99,6 +169,9 @@ function getFirestoreClient(): Firestore {
 }
 
 async function detectRuntimeServiceAccount(): Promise<string | null> {
+  if (configuredServiceAccountEmail) {
+    return configuredServiceAccountEmail;
+  }
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 1500);
@@ -117,23 +190,37 @@ async function detectRuntimeServiceAccount(): Promise<string | null> {
   }
 }
 
+function buildFirestoreRemediation(errorMsg: string, serviceAccount: string | null): string | null {
+  if (!errorMsg.includes('PERMISSION_DENIED')) return null;
+  const sa = serviceAccount || '<runtime-service-account>';
+  return (
+    `Grant roles/datastore.user to ${sa} on GCP project "${firebaseConfig.projectId}" ` +
+    `(gcloud projects add-iam-policy-binding ${firebaseConfig.projectId} --member="serviceAccount:${sa}" --role="roles/datastore.user"), ` +
+    `or set FIREBASE_SERVICE_ACCOUNT_JSON for project "${firebaseConfig.projectId}", or deploy directly to Cloud Run in "${firebaseConfig.projectId}".`
+  );
+}
+
 export function getDbInfo(): {
   ready: boolean;
   driver: 'firestore';
   projectId: string;
   databaseId: string;
+  credentialSource: 'service_account_json' | 'adc';
   error: string | null;
   checkedAt: string | null;
   serviceAccount: string | null;
+  remediation: string | null;
 } {
   return {
     ready: lastProbeStatus.connected,
     driver: 'firestore',
     projectId: firebaseConfig.projectId,
     databaseId: firebaseConfig.firestoreDatabaseId,
+    credentialSource,
     error: lastProbeStatus.error,
     checkedAt: lastProbeStatus.checkedAt,
     serviceAccount: lastProbeStatus.serviceAccount,
+    remediation: lastProbeStatus.remediation,
   };
 }
 
@@ -141,10 +228,11 @@ export async function probeFirestoreConnection(): Promise<{
   connected: boolean;
   error: string | null;
   serviceAccount: string | null;
+  remediation: string | null;
 }> {
-  const serviceAccount = await detectRuntimeServiceAccount();
   try {
     const db = getFirestoreClient();
+    const serviceAccount = await detectRuntimeServiceAccount();
     const probeRef = db.collection('system').doc('_health_probe');
     const probeVal = `probe_${Date.now()}`;
     await probeRef.set({ probeVal, updatedAt: nowIso() });
@@ -161,17 +249,21 @@ export async function probeFirestoreConnection(): Promise<{
       checkedAt: nowIso(),
       error: null,
       serviceAccount,
+      remediation: null,
     };
-    return { connected: true, error: null, serviceAccount };
+    return { connected: true, error: null, serviceAccount, remediation: null };
   } catch (err) {
+    const serviceAccount = await detectRuntimeServiceAccount();
     const msg = err instanceof Error ? err.message : String(err);
+    const remediation = buildFirestoreRemediation(msg, serviceAccount);
     lastProbeStatus = {
       connected: false,
       checkedAt: nowIso(),
       error: msg,
       serviceAccount,
+      remediation,
     };
-    return { connected: false, error: msg, serviceAccount };
+    return { connected: false, error: msg, serviceAccount, remediation };
   }
 }
 
@@ -294,28 +386,37 @@ async function ensureDefaultSettings(): Promise<void> {
 }
 
 export async function getBotSettings(): Promise<BotSettings> {
-  const db = getFirestoreClient();
-  const ref = db.collection('system').doc('bot_settings');
-  const snap = await ref.get();
-  if (!snap.exists) {
-    const def = defaultBotSettings();
-    await ref.set(def);
-    return def;
-  }
-  return mapBotSettings(snap.data());
+  return withFirestoreRetry(async () => {
+    const db = getFirestoreClient();
+    const ref = db.collection('system').doc('bot_settings');
+    const snap = await ref.get();
+    if (!snap.exists) {
+      const def = defaultBotSettings();
+      await ref.set(def);
+      return def;
+    }
+    return mapBotSettings(snap.data());
+  });
 }
 
 export async function updateBotSettings(
   patch: Partial<Omit<BotSettings, 'updatedAt'>>
 ): Promise<BotSettings> {
-  const db = getFirestoreClient();
-  const ref = db.collection('system').doc('bot_settings');
-  const cleanPatch: Record<string, unknown> = { updatedAt: nowIso() };
-  for (const [key, value] of Object.entries(patch)) {
-    if (value !== undefined) cleanPatch[key] = value;
-  }
-  await ref.set(cleanPatch, { merge: true });
-  return getBotSettings();
+  return withFirestoreRetry(async () => {
+    const db = getFirestoreClient();
+    const ref = db.collection('system').doc('bot_settings');
+    return db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const current = snap.exists ? mapBotSettings(snap.data()) : defaultBotSettings();
+      const next: BotSettings = {
+        ...current,
+        ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)),
+        updatedAt: nowIso(),
+      } as BotSettings;
+      tx.set(ref, next, { merge: true });
+      return next;
+    });
+  });
 }
 
 export async function getUserLanguagePreference(
@@ -364,8 +465,75 @@ export async function setUserLanguagePreference(params: {
     updatedAt: nowIso(),
   };
 
-  await db.collection('user_preferences').doc(cleanId).set(record, { merge: true });
+  await withFirestoreRetry(() =>
+    db.collection('user_preferences').doc(cleanId).set(record, { merge: true })
+  );
   return record;
+}
+
+export async function getUserProfile(userId: string): Promise<UserProfile | null> {
+  const cleanId = userId.trim();
+  if (!/^[0-9]+$/.test(cleanId)) return null;
+  return withFirestoreRetry(async () => {
+    const db = getFirestoreClient();
+    const snap = await db.collection('user_profiles').doc(cleanId).get();
+    if (!snap.exists) return null;
+    const d = snap.data()!;
+    return {
+      userId: String(d.userId || cleanId),
+      channel: (d.channel as ChatChannel) || 'business_chat',
+      username: String(d.username || ''),
+      displayName: String(d.displayName || ''),
+      languageCode: String(d.languageCode || ''),
+      messageCount: Number(d.messageCount || 0),
+      lastSeenAt: asIsoString(d.lastSeenAt),
+      createdAt: asIsoString(d.createdAt),
+      updatedAt: asIsoString(d.updatedAt),
+    };
+  });
+}
+
+export async function upsertUserProfile(params: {
+  userId: string;
+  channel: ChatChannel;
+  username?: string;
+  displayName?: string;
+  languageCode?: string;
+}): Promise<void> {
+  const cleanId = params.userId.trim();
+  if (!/^[0-9]+$/.test(cleanId)) return;
+  await withFirestoreRetry(async () => {
+    const db = getFirestoreClient();
+    const ref = db.collection('user_profiles').doc(cleanId);
+    const ts = nowIso();
+    const snap = await ref.get();
+    if (!snap.exists) {
+      await ref.set({
+        userId: cleanId,
+        channel: params.channel,
+        username: (params.username || '').slice(0, 64),
+        displayName: (params.displayName || '').slice(0, 120),
+        languageCode: (params.languageCode || '').slice(0, 16),
+        messageCount: 1,
+        lastSeenAt: ts,
+        createdAt: ts,
+        updatedAt: ts,
+      });
+      return;
+    }
+    const patch: Record<string, unknown> = {
+      channel: params.channel,
+      messageCount: FieldValue.increment(1),
+      lastSeenAt: ts,
+      updatedAt: ts,
+    };
+    if (params.username !== undefined) patch.username = params.username.slice(0, 64);
+    if (params.displayName !== undefined) patch.displayName = params.displayName.slice(0, 120);
+    if (params.languageCode !== undefined && params.languageCode) {
+      patch.languageCode = params.languageCode.slice(0, 16);
+    }
+    await ref.set(patch, { merge: true });
+  });
 }
 
 export async function claimDedupKey(dedupKey: string): Promise<boolean> {
@@ -500,14 +668,19 @@ export async function createMemoryRecord(params: {
   return { id, ...entry };
 }
 
-function mapMemoryDoc(id: string, d: Record<string, unknown>): MemoryEntry {
+function mapMemoryDoc(id: string, d: Record<string, unknown> | undefined): MemoryEntry | null {
+  if (!d || typeof d.content !== 'string' || !d.content.trim()) {
+    return null;
+  }
+  const scope = d.scope === 'owner' || d.scope === 'chat' ? d.scope : null;
+  if (!scope) return null;
   return {
     id,
     type: (d.type as MemoryType) || 'owner_fact',
-    scope: (d.scope as MemoryScope) || 'owner',
+    scope,
     channel: (d.channel as MemoryEntry['channel']) || 'global',
     chatId: String(d.chatId || ''),
-    content: String(d.content || ''),
+    content: d.content.trim(),
     provenance: String(d.provenance || ''),
     tags: String(d.tags || ''),
     expiresAtMs: Number(d.expiresAtMs || 0),
@@ -522,36 +695,50 @@ export async function listScopedMemories(params: {
   chatId: string;
   limit?: number;
 }): Promise<MemoryEntry[]> {
-  const db = getFirestoreClient();
-  const limit = params.limit ?? 30;
-  const nowMs = Date.now();
+  return withFirestoreRetry(async () => {
+    const db = getFirestoreClient();
+    const limit = params.limit ?? 30;
+    const nowMs = Date.now();
 
-  const [ownerSnap, chatSnap] = await Promise.all([
-    db.collection('memories').where('scope', '==', 'owner').orderBy('createdAtMs', 'desc').limit(limit).get(),
-    db
-      .collection('memories')
-      .where('channel', '==', params.channel)
-      .where('chatId', '==', params.chatId)
-      .orderBy('createdAtMs', 'desc')
-      .limit(limit)
-      .get(),
-  ]);
+    // Only load owner-scoped memories in private owner channel (bot_direct).
+    const queries = [
+      db
+        .collection('memories')
+        .where('channel', '==', params.channel)
+        .where('chatId', '==', params.chatId)
+        .orderBy('createdAtMs', 'desc')
+        .limit(limit)
+        .get(),
+    ];
+    if (params.channel === 'bot_direct') {
+      queries.unshift(
+        db.collection('memories').where('scope', '==', 'owner').orderBy('createdAtMs', 'desc').limit(limit).get()
+      );
+    }
 
-  const combined = [
-    ...ownerSnap.docs.map((doc) => mapMemoryDoc(doc.id, doc.data())),
-    ...chatSnap.docs.map((doc) => mapMemoryDoc(doc.id, doc.data())),
-  ];
-
-  return combined.filter((m) => m.expiresAtMs === 0 || m.expiresAtMs > nowMs);
+    const snaps = await Promise.all(queries);
+    const combined: MemoryEntry[] = [];
+    for (const snap of snaps) {
+      for (const doc of snap.docs) {
+        const mapped = mapMemoryDoc(doc.id, doc.data());
+        if (mapped && (mapped.expiresAtMs === 0 || mapped.expiresAtMs > nowMs)) {
+          combined.push(mapped);
+        }
+      }
+    }
+    return combined;
+  });
 }
 
 export async function listAllMemories(limit = 40): Promise<MemoryEntry[]> {
-  const db = getFirestoreClient();
-  const snap = await db.collection('memories').orderBy('createdAtMs', 'desc').limit(limit).get();
-  const nowMs = Date.now();
-  return snap.docs
-    .map((d) => mapMemoryDoc(d.id, d.data()))
-    .filter((m) => m.expiresAtMs === 0 || m.expiresAtMs > nowMs);
+  return withFirestoreRetry(async () => {
+    const db = getFirestoreClient();
+    const snap = await db.collection('memories').orderBy('createdAtMs', 'desc').limit(limit).get();
+    const nowMs = Date.now();
+    return snap.docs
+      .map((d) => mapMemoryDoc(d.id, d.data()))
+      .filter((m): m is MemoryEntry => m !== null && (m.expiresAtMs === 0 || m.expiresAtMs > nowMs));
+  });
 }
 
 export async function searchMemoryRecords(keyword: string, limit = 25): Promise<MemoryEntry[]> {
@@ -777,55 +964,201 @@ export async function countPendingApprovals(): Promise<number> {
   return snap.data().count;
 }
 
+function mapQueueJobDoc(id: string, d: Record<string, unknown>): QueueJob {
+  return {
+    id,
+    channel: (d.channel as ChatChannel) || 'business_chat',
+    chatId: String(d.chatId || ''),
+    messageId: Number(d.messageId || 0),
+    payloadJson: String(d.payloadJson || '{}'),
+    status: (d.status as QueueJob['status']) || 'queued',
+    attempts: Number(d.attempts || 0),
+    workerId: String(d.workerId || ''),
+    leaseExpiresAtMs: Number(d.leaseExpiresAtMs || 0),
+    nextAttemptAtMs: Number(d.nextAttemptAtMs || 0),
+    deliveryState:
+      d.deliveryState === 'delivered' || d.deliveryState === 'uncertain' ? d.deliveryState : 'pending',
+    sentTelegramMessageId: Number(d.sentTelegramMessageId || 0),
+    sentMediaType: String(d.sentMediaType || ''),
+    lastError: String(d.lastError || ''),
+    createdAtMs: Number(d.createdAtMs || 0),
+    createdAt: asIsoString(d.createdAt),
+    updatedAt: asIsoString(d.updatedAt),
+  };
+}
+
 export async function enqueueJob(params: {
   channel: ChatChannel;
   chatId: string;
   messageId: number;
   payload: unknown;
 }): Promise<string> {
-  const db = getFirestoreClient();
-  const id = `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const ts = nowIso();
-  await db.collection('message_queue').doc(id).set({
-    channel: params.channel,
-    chatId: params.chatId,
-    messageId: params.messageId,
-    payloadJson: JSON.stringify(params.payload),
-    status: 'queued',
-    attempts: 0,
-    lastError: '',
-    createdAtMs: Date.now(),
-    createdAt: ts,
-    updatedAt: ts,
+  return withFirestoreRetry(async () => {
+    const db = getFirestoreClient();
+    const id = `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const nowMs = Date.now();
+    const ts = nowIso();
+    await db.collection('message_queue').doc(id).set({
+      channel: params.channel,
+      chatId: params.chatId,
+      messageId: params.messageId,
+      payloadJson: JSON.stringify(params.payload),
+      status: 'queued',
+      attempts: 0,
+      workerId: '',
+      leaseExpiresAtMs: 0,
+      nextAttemptAtMs: nowMs,
+      deliveryState: 'pending',
+      sentTelegramMessageId: 0,
+      sentMediaType: '',
+      lastError: '',
+      createdAtMs: nowMs,
+      createdAt: ts,
+      updatedAt: ts,
+    });
+    return id;
   });
-  return id;
 }
 
 export async function fetchQueuedJobs(limit = 10): Promise<QueueJob[]> {
-  const db = getFirestoreClient();
-  const snap = await db
-    .collection('message_queue')
-    .where('status', '==', 'queued')
-    .orderBy('createdAtMs', 'asc')
-    .limit(limit)
-    .get();
+  return withFirestoreRetry(async () => {
+    const db = getFirestoreClient();
+    const snap = await db
+      .collection('message_queue')
+      .where('status', '==', 'queued')
+      .orderBy('createdAtMs', 'asc')
+      .limit(limit)
+      .get();
 
-  return snap.docs.map((docSnap) => {
-    const d = docSnap.data();
-    return {
-      id: docSnap.id,
-      channel: (d.channel as ChatChannel) || 'business_chat',
-      chatId: String(d.chatId),
-      messageId: Number(d.messageId || 0),
-      payloadJson: String(d.payloadJson || '{}'),
-      status: (d.status as QueueJob['status']) || 'queued',
-      attempts: Number(d.attempts || 0),
-      lastError: String(d.lastError || ''),
-      createdAtMs: Number(d.createdAtMs || 0),
-      createdAt: asIsoString(d.createdAt),
-      updatedAt: asIsoString(d.updatedAt),
-    };
+    return snap.docs.map((docSnap) => mapQueueJobDoc(docSnap.id, docSnap.data()));
   });
+}
+
+export async function claimQueuedJobs(params: {
+  workerId: string;
+  limit?: number;
+  leaseDurationMs?: number;
+}): Promise<QueueJob[]> {
+  const limit = params.limit ?? 5;
+  const leaseDurationMs = params.leaseDurationMs ?? 90_000;
+  const db = getFirestoreClient();
+  const nowMs = Date.now();
+
+  const [queuedSnap, expiredSnap] = await Promise.all([
+    db
+      .collection('message_queue')
+      .where('status', '==', 'queued')
+      .orderBy('createdAtMs', 'asc')
+      .limit(limit * 3)
+      .get(),
+    db
+      .collection('message_queue')
+      .where('status', '==', 'processing')
+      .where('leaseExpiresAtMs', '<', nowMs)
+      .orderBy('leaseExpiresAtMs', 'asc')
+      .limit(limit)
+      .get(),
+  ]);
+
+  const candidates = [
+    ...expiredSnap.docs,
+    ...queuedSnap.docs.filter((doc) => Number(doc.data().nextAttemptAtMs || 0) <= nowMs),
+  ].slice(0, limit);
+
+  const claimed: QueueJob[] = [];
+  for (const cand of candidates) {
+    try {
+      const locked = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(cand.ref);
+        if (!snap.exists) return null;
+        const d = snap.data()!;
+        const status = String(d.status || 'queued');
+        const nextAttempt = Number(d.nextAttemptAtMs || 0);
+        const leaseExp = Number(d.leaseExpiresAtMs || 0);
+
+        const isReadyQueued = status === 'queued' && nextAttempt <= nowMs;
+        const isExpiredLease = status === 'processing' && leaseExp > 0 && leaseExp < nowMs;
+        if (!isReadyQueued && !isExpiredLease) {
+          return null;
+        }
+
+        const nextAttempts = Number(d.attempts || 0) + 1;
+        const newLeaseExp = nowMs + leaseDurationMs;
+        const ts = nowIso();
+        tx.set(
+          cand.ref,
+          {
+            status: 'processing',
+            workerId: params.workerId,
+            leaseExpiresAtMs: newLeaseExp,
+            attempts: nextAttempts,
+            updatedAt: ts,
+          },
+          { merge: true }
+        );
+
+        return mapQueueJobDoc(snap.id, {
+          ...d,
+          status: 'processing',
+          workerId: params.workerId,
+          leaseExpiresAtMs: newLeaseExp,
+          attempts: nextAttempts,
+          updatedAt: ts,
+        });
+      });
+
+      if (locked) {
+        claimed.push(locked);
+      }
+    } catch {
+      // Another worker contended on the same transaction; skip cleanly
+    }
+  }
+
+  return claimed;
+}
+
+export async function markQueueJobDelivered(
+  id: string,
+  delivery: { sentTelegramMessageId: number; sentMediaType: string }
+): Promise<void> {
+  await withFirestoreRetry(() =>
+    getFirestoreClient()
+      .collection('message_queue')
+      .doc(id)
+      .set(
+        {
+          deliveryState: 'delivered',
+          sentTelegramMessageId: delivery.sentTelegramMessageId,
+          sentMediaType: delivery.sentMediaType.slice(0, 24),
+          updatedAt: nowIso(),
+        },
+        { merge: true }
+      )
+  );
+}
+
+export async function scheduleQueueJobRetry(
+  id: string,
+  params: { attempts: number; nextAttemptAtMs: number; lastError: string }
+): Promise<void> {
+  await withFirestoreRetry(() =>
+    getFirestoreClient()
+      .collection('message_queue')
+      .doc(id)
+      .set(
+        {
+          status: 'queued',
+          workerId: '',
+          leaseExpiresAtMs: 0,
+          attempts: params.attempts,
+          nextAttemptAtMs: params.nextAttemptAtMs,
+          lastError: sanitizeForLog(params.lastError).slice(0, 1000),
+          updatedAt: nowIso(),
+        },
+        { merge: true }
+      )
+  );
 }
 
 export async function updateQueueJobStatus(
@@ -837,9 +1170,13 @@ export async function updateQueueJobStatus(
     status: updates.status,
     updatedAt: nowIso(),
   };
+  if (updates.status !== 'processing') {
+    patch.workerId = '';
+    patch.leaseExpiresAtMs = 0;
+  }
   if (updates.attempts !== undefined) patch.attempts = updates.attempts;
   if (updates.lastError !== undefined) patch.lastError = sanitizeForLog(updates.lastError).slice(0, 1000);
-  await db.collection('message_queue').doc(id).set(patch, { merge: true });
+  await withFirestoreRetry(() => db.collection('message_queue').doc(id).set(patch, { merge: true }));
 }
 
 export async function getQueueMetrics(): Promise<{

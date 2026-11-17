@@ -239,6 +239,11 @@ service cloud.firestore {
       allow list: if isOwnerAdmin() && resource.data.uiLanguage in ['uz_lat', 'uz_cyr', 'uz_new', 'ru', 'en'];
     }
 
+    match /user_profiles/{userId} {
+      allow get: if isValidId(userId) && isOwnerAdmin();
+      allow list: if isOwnerAdmin() && isValidChannel(resource.data.channel);
+    }
+
     match /message_queue/{jobId} {
       allow read, write: if false;
     }

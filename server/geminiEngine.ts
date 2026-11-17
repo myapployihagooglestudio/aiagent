@@ -1,4 +1,9 @@
-import { generateIntelligentReply, isGeminiConfigured, type BrainAttachmentPart } from './ai/brain.ts';
+import {
+  generateIntelligentReply,
+  isGeminiConfigured,
+  verifyGeminiModelAvailability,
+  type BrainAttachmentPart,
+} from './ai/brain.ts';
 import {
   analyzeVideoWithFfmpeg,
   generateRoundVideoNote,
@@ -18,6 +23,7 @@ import type {
 
 export {
   isGeminiConfigured,
+  verifyGeminiModelAvailability,
   transcribeAudioBuffer,
   synthesizeVoiceNote,
   analyzeVideoWithFfmpeg,
@@ -45,6 +51,7 @@ export interface DraftReplyInput {
   conversationHistory: Array<{ role: 'user' | 'assistant' | 'owner'; text: string }>;
   inboundText: string;
   attachments?: BrainAttachmentPart[];
+  dedupKey?: string;
 }
 
 export interface DraftReplyResult {
@@ -56,6 +63,9 @@ export interface DraftReplyResult {
   escalationReason: string;
   safetyBlocked: boolean;
   qcPassed: boolean;
+  qcIssues: string[];
+  verifiedByModel: boolean;
+  qcError?: string;
 }
 
 export async function generateAssistantReply(input: DraftReplyInput): Promise<DraftReplyResult> {
@@ -80,6 +90,7 @@ export async function generateAssistantReply(input: DraftReplyInput): Promise<Dr
     conversationHistory: input.conversationHistory,
     inboundText: input.inboundText,
     attachments: input.attachments,
+    dedupKey: input.dedupKey,
   });
 
   return {
@@ -91,6 +102,9 @@ export async function generateAssistantReply(input: DraftReplyInput): Promise<Dr
     escalationReason: result.escalationReason,
     safetyBlocked: result.safetyBlocked,
     qcPassed: result.qcPassed,
+    qcIssues: result.qcIssues,
+    verifiedByModel: result.verifiedByModel,
+    ...(result.qcError ? { qcError: result.qcError } : {}),
   };
 }
 

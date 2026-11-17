@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import express, { type Request, type Response } from 'express';
+import { geminiQuotaManager } from './server/ai/geminiQuotaManager.ts';
+import { sanitizeForLog } from './server/ai/securityFilter.ts';
 import {
   closeDatabase,
   getBotSettings,
@@ -9,7 +11,7 @@ import {
   probeFirestoreConnection,
   writeAuditLog,
 } from './server/db.ts';
-import { isGeminiConfigured } from './server/geminiEngine.ts';
+import { isGeminiConfigured, verifyGeminiModelAvailability } from './server/geminiEngine.ts';
 import { BOT_COMMANDS_LIST } from './server/i18nBot.ts';
 import {
   handleTelegramWebhookUpdate,
@@ -110,6 +112,8 @@ async function healthHandler(_req: Request, res: Response) {
       TELEGRAM_OWNER_USER_ID: botEnv.ownerUserId !== null,
       APP_URL: Boolean(resolvePublicAppUrl()),
     },
+    ownerLocked: botEnv.ownerUserId !== null,
+    geminiQuota: geminiQuotaManager.getStatsSnapshot(),
     telegramStartup,
     queue,
     botState: settingsSummary,
@@ -119,9 +123,25 @@ async function healthHandler(_req: Request, res: Response) {
 app.get('/health', healthHandler);
 app.get('/api/health', healthHandler);
 
+const failedAuthAttempts = new Map<string, { count: number; windowStart: number }>();
+
 async function webhookHandler(req: Request, res: Response): Promise<void> {
+  const clientIp = req.ip || 'unknown';
+  const now = Date.now();
+  const prevAuth = failedAuthAttempts.get(clientIp);
+  if (prevAuth && now - prevAuth.windowStart < 60_000 && prevAuth.count >= 25) {
+    res.status(429).json({ ok: false, error: 'Too many unauthorized webhook requests' });
+    return;
+  }
+
   const secretHeader = req.header('x-telegram-bot-api-secret-token');
   if (!verifyWebhookSecretHeader(secretHeader)) {
+    const entry =
+      prevAuth && now - prevAuth.windowStart < 60_000
+        ? { count: prevAuth.count + 1, windowStart: prevAuth.windowStart }
+        : { count: 1, windowStart: now };
+    failedAuthAttempts.set(clientIp, entry);
+
     await writeAuditLog({
       channel: 'system',
       eventType: 'webhook_auth_rejected',
@@ -132,16 +152,22 @@ async function webhookHandler(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  const update = req.body as TelegramUpdatePayload;
+  if (!update || typeof update !== 'object' || typeof update.update_id !== 'number') {
+    res.status(400).json({ ok: false, error: 'Invalid Telegram update payload' });
+    return;
+  }
+
   res.status(200).json({ ok: true });
 
-  const update = req.body as TelegramUpdatePayload;
   void handleTelegramWebhookUpdate(update).catch(async (err) => {
+    const safeErr = sanitizeForLog(err instanceof Error ? err.message : String(err));
     await writeAuditLog({
       channel: 'system',
       eventType: 'webhook_processing_error',
       severity: 'error',
-      summary: `Failed processing update ${update?.update_id ?? 'unknown'}`,
-      details: err instanceof Error ? err.message : String(err),
+      summary: `Failed processing update ${update.update_id}`,
+      details: safeErr,
     }).catch(() => {});
   });
 }
@@ -198,16 +224,43 @@ async function bootstrapTelegramOnStart(): Promise<void> {
 }
 
 async function startServer(): Promise<void> {
+  const geminiCfg = geminiQuotaManager.loadAndValidateStartupConfig();
+  console.log(
+    `[Omnia AI] Gemini config loaded: primary=${geminiCfg.primaryModel}, fallback=${
+      geminiCfg.fallbackModel || 'none'
+    }, maxConcurrency=${geminiCfg.maxConcurrency}, appRpmSafetyLimit=${geminiCfg.rpmLimit} (${
+      geminiCfg.rpmLimitNote
+    })`
+  );
+  for (const warning of geminiCfg.warnings) {
+    console.warn(`[Omnia AI] Gemini config warning: ${warning}`);
+  }
+  if (geminiCfg.fallbackModel && isGeminiConfigured()) {
+    const fallbackOk = await geminiQuotaManager.verifyConfiguredFallbackModel(
+      verifyGeminiModelAvailability
+    );
+    console.log(
+      `[Omnia AI] Optional fallback model "${geminiCfg.fallbackModel}" availability check: ${
+        fallbackOk ? 'VERIFIED' : 'UNAVAILABLE (disabled)'
+      }`
+    );
+  }
+
   await initDatabase();
   const dbInfo = getDbInfo();
   if (dbInfo.ready) {
-    console.log(`[Omnia AI] Firestore connected (${dbInfo.projectId} / ${dbInfo.databaseId})`);
+    console.log(
+      `[Omnia AI] Firestore connected (${dbInfo.projectId} / ${dbInfo.databaseId}, auth=${dbInfo.credentialSource})`
+    );
   } else {
     console.error(
       `[Omnia AI] Firestore probe failed (${dbInfo.projectId} / ${dbInfo.databaseId}) as ${
         dbInfo.serviceAccount || 'unknown ADC'
       }: ${dbInfo.error}`
     );
+    if (dbInfo.remediation) {
+      console.warn(`[Omnia AI] Firestore IAM remediation: ${dbInfo.remediation}`);
+    }
   }
 
   const server = app.listen(PORT, '0.0.0.0', () => {
@@ -219,7 +272,7 @@ async function startServer(): Promise<void> {
   });
 
   const shutdown = async () => {
-    stopQueueWorker();
+    await stopQueueWorker();
     server.close(async () => {
       await closeDatabase();
       process.exit(0);

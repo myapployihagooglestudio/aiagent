@@ -4,6 +4,7 @@ export type DetectedLangCode = 'uz_lat' | 'uz_cyr' | 'uz_new' | 'ru' | 'en' | 'm
 
 const NEW_UZBEK_CHARS_RE = /[şçöğŞÇÖĞ]/;
 const UZ_CYRILLIC_SPECIFIC_RE = /[ўқғҳЎҚҒҲ]/;
+const RU_CYRILLIC_SPECIFIC_RE = /[ыэщъЫЭЩЪ]/;
 const CYRILLIC_RE = /[а-яА-ЯёЁўқғҳЎҚҒҲ]/g;
 const LATIN_RE = /[a-zA-ZşçöğŞÇÖĞ]/g;
 
@@ -11,19 +12,19 @@ const LATIN_RE = /[a-zA-ZşçöğŞÇÖĞ]/g;
 const APOSTROPHE_CLASS = `['’‘ʼ\`´ʻʹ′]`;
 
 const UZ_LATIN_WORDS_RE =
-  /(?<![\p{L}\p{N}])(?:salom|assalomu|alaykum|qalay|qalaysiz|nima|qancha|yaxshi|yaxşi|rahmat|raxmat|kerak|kere|bopti|böpti|xo'p|xöp|xop|ha|yo'q|yöq|yoq|bugun|ertaga|iltimos|yordam|men|siz|biz|uchun|uçun|bilan|qachon|qaçon|qayerda|qatta|aka|uka|opa|do'stim|döstim|shahar|şahar|chiroyli|çiroyli|o'zbek|özbek|to'g'ri|töğri)(?![\p{L}\p{N}])/giu;
+  /(?<![\p{L}\p{N}])(?:salom|assalomu|alaykum|qalay|qalaysiz|nima|qancha|yaxshi|yaxşi|rahmat|raxmat|kerak|kere|bopti|böpti|xo'p|xöp|xop|ha|yo'q|yöq|yoq|bugun|ertaga|iltimos|yordam|men|siz|biz|uchun|uçun|bilan|qachon|qaçon|qayerda|qatta|aka|uka|opa|do'stim|döstim|shahar|şahar|chiroyli|çiroyli|o'zbek|özbek|to'g'ri|töğri|qanday|mumkin|bo'ladi|böladi|ishlaydi|işlaydi|bormi)(?![\p{L}\p{N}])/giu;
 
 const UZ_CYR_WORDS_RE =
-  /(?<![\p{L}\p{N}])(?:салом|ассалому|алайкум|рахмат|яхши|нима|қанча|керак|борми|йўқ|бугун|эртага|илтимос|қалай|мен|сиз|учун|билан|ўзбек)(?![\p{L}\p{N}])/giu;
+  /(?<![\p{L}\p{N}])(?:салом|ассалому|алайкум|рахмат|раҳмат|яхши|нима|қанча|керак|борми|йўқ|бугун|эртага|илтимос|қалай|мен|сиз|учун|билан|ўзбек|қандай|мумкин|бўлади|ишлайди)(?![\p{L}\p{N}])/giu;
 
 const RU_WORDS_RE =
-  /(?<![\p{L}\p{N}])(?:привет|здравствуйте|спасибо|пожалуйста|сколько|когда|можно|нужно|хорошо|сегодня|завтра|помоги|давай|ладно|почему|как|что|где|встреча|во)(?![\p{L}\p{N}])/giu;
+  /(?<![\p{L}\p{N}])(?:привет|здравствуйте|спасибо|пожалуйста|сколько|когда|можно|нужно|хорошо|сегодня|завтра|помоги|давай|ладно|почему|как|что|где|встреча|во|это|для|или|нет|да|подскажите|расскажите)(?![\p{L}\p{N}])/giu;
 
 const EN_WORDS_RE =
-  /\b(?:hello|hi|please|thanks|thank|how|what|when|where|why|can|could|would|today|tomorrow|help|good|okay|meeting|schedule)\b/gi;
+  /\b(?:the|and|is|are|was|were|you|your|for|with|this|that|hello|hi|please|thanks|thank|how|what|when|where|why|can|could|would|today|tomorrow|help|good|okay|meeting|schedule|explain|create)\b/gi;
 
 export function detectScriptAndLanguage(text: string): DetectedLangCode {
-  const sample = (text || '').trim();
+  const sample = (text || '').normalize('NFC').trim();
   if (!sample) return 'uz_lat';
 
   const cyrMatches = sample.match(CYRILLIC_RE)?.length ?? 0;
@@ -36,7 +37,6 @@ export function detectScriptAndLanguage(text: string): DetectedLangCode {
 
   // Mixed Uzbek (any script) + Russian
   if ((uzLatHits > 0 || hasNewUzbekChars || uzCyrHits > 0) && ruHits > 0 && cyrMatches > 0) {
-    // Distinguish pure Uzbek Cyrillic from mixed Uzbek+Russian
     if (latMatches > 0 || (uzCyrHits > 0 && ruHits > 0)) {
       return 'mixed_uz_ru';
     }
@@ -44,6 +44,7 @@ export function detectScriptAndLanguage(text: string): DetectedLangCode {
 
   if (cyrMatches > latMatches) {
     if (UZ_CYRILLIC_SPECIFIC_RE.test(sample) || uzCyrHits > ruHits) return 'uz_cyr';
+    if (RU_CYRILLIC_SPECIFIC_RE.test(sample) || ruHits > uzCyrHits) return 'ru';
     return 'ru';
   }
 
@@ -51,7 +52,7 @@ export function detectScriptAndLanguage(text: string): DetectedLangCode {
     return 'uz_new';
   }
 
-  if (uzLatHits >= enHits && uzLatHits > 0) return 'uz_lat';
+  if (uzLatHits > enHits) return 'uz_lat';
   if (enHits > uzLatHits && latMatches > 0) return 'en';
   if (new RegExp(`[oOgG]${APOSTROPHE_CLASS}`).test(sample) || /\b(?:sh|ch)\w+/i.test(sample)) {
     return 'uz_lat';
@@ -73,7 +74,7 @@ const SLANG_HINTS: Array<[RegExp, string]> = [
 ];
 
 export function extractInformalUzbekHints(text: string): string {
-  let normalized = text;
+  let normalized = (text || '').normalize('NFC');
   const notes: string[] = [];
   for (const [re, replacement] of SLANG_HINTS) {
     if (re.test(normalized)) {
@@ -85,11 +86,14 @@ export function extractInformalUzbekHints(text: string): string {
   return `Informal Uzbek normalization: "${normalized}"`;
 }
 
-// Protected spans (IMPORTANT: outer single capturing group only; all inner groups must be non-capturing (?:...))
-// Preserves: fenced code blocks, inline code, URLs, emails, @mentions, #hashtags,
-// Arabic Quranic/Hadith unicode runs, brand/tech words, and common English loanwords with sh/ch.
-const PROTECTED_SPAN_RE =
-  /(```[\s\S]*?```|(?<![A-Za-z0-9])`[^`\n]+`(?![A-Za-z0-9])|https?:\/\/[^\s<>()]+|www\.[^\s<>()]+|[\w.+-]+@[\w-]+\.[\w.-]+|@[A-Za-z0-9_]+|#[A-Za-z0-9_]+|[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+(?:[\s\u0640]+[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+)*|\b(?:Assalomu alaykum|Va alaykum assalom|Inshaalloh|Alhamdulillah|Mashalloh|Subhanalloh|Bismillah|Ассалому алайкум|Иншааллоҳ|Алҳамдулиллаҳ|OMNIA AI|Telegram|Gemini|Google|WhatsApp|TypeScript|JavaScript|Firestore|Cloud Run|Webhook|ChatGPT|YouTube|GitHub|Android|iPhone|Dashboard|Bluetooth|English|Russian|Turkish|French|Spanish|Push|Flash|Search|Cache|Check|Channel|Switch|Patch|Match|Batch|Branch|Launch|Chrome|Shell|Bash|Hash|SSH|HTTPS)\b)/gi;
+// Case-sensitive protected spans: fenced code blocks, inline code, URLs, emails,
+// @mentions, #hashtags, Unix/relative file paths, filenames, snake_case, camelCase, and Arabic runs.
+const PROTECTED_SYNTAX_RE =
+  /```[\s\S]*?```|(?<![A-Za-z0-9])`[^`\n]+`(?![A-Za-z0-9])|https?:\/\/[^\s<>()]+|www\.[^\s<>()]+|[\w.+-]+@[\w-]+\.[\w.-]+|@[A-Za-z0-9_]+|#[A-Za-z0-9_]+|(?:\/[A-Za-z0-9._-]+){2,}|(?<![A-Za-z0-9_-])[A-Za-z0-9_-]+\.(?:ts|js|tsx|jsx|json|sh|py|md|yml|yaml|env|rules)\b|\b[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+\b|\b[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*\b|[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+(?:[\s\u0640]+[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+)*/g;
+
+// Case-insensitive protected lexicon: Arabic/Islamic greetings, brand names, and tech loanwords containing sh/ch.
+const PROTECTED_LEXICON_RE =
+  /\b(?:Assalomu alaykum|Va alaykum assalom|Inshaalloh|Alhamdulillah|Mashalloh|Subhanalloh|Bismillah|Ассалому алайкум|Иншааллоҳ|Алҳамдулиллаҳ|OMNIA AI|Telegram|Gemini|Google|WhatsApp|TypeScript|JavaScript|Firestore|Cloud Run|Webhook|ChatGPT|YouTube|GitHub|Android|iPhone|Dashboard|Bluetooth|English|Russian|Turkish|French|Spanish|Docker|Node\.js|Push|Flash|Search|Cache|Check|Channel|Switch|Patch|Match|Batch|Branch|Launch|Chrome|Shell|Bash|Hash|SSH|HTTPS)\b/gi;
 
 const LAT_TO_CYR_DIGRAPHS: Array<[RegExp, string]> = [
   [new RegExp(`O${APOSTROPHE_CLASS}`, 'g'), 'Ў'],
@@ -146,6 +150,7 @@ const G_APOS_LOWER_RE = new RegExp(`g${APOSTROPHE_CLASS}`, 'g');
 const ALL_APOS_IN_LAT_RE = new RegExp(APOSTROPHE_CLASS, 'g');
 
 function convertSegmentLatToNew(seg: string): string {
+  // Prevent double transliteration on words already written with New Uzbek letters
   return seg
     .replace(O_APOS_UPPER_RE, 'Ö')
     .replace(O_APOS_LOWER_RE, 'ö')
@@ -196,7 +201,6 @@ function convertSegmentNewToLat(seg: string): string {
 }
 
 function convertSegmentLatToCyr(seg: string): string {
-  // If segment has New Uzbek chars first normalize New -> Lat cleanly
   let out = NEW_UZBEK_CHARS_RE.test(seg) ? convertSegmentNewToLat(seg) : seg;
   for (const [re, rep] of LAT_TO_CYR_DIGRAPHS) {
     out = out.replace(re, rep);
@@ -219,27 +223,31 @@ export function transliterateUzbek(
   if (!text) return '';
   if (target === 'ru' || target === 'en') return text;
 
-  const parts = text.split(PROTECTED_SPAN_RE);
-  return parts
-    .map((part, idx) => {
-      // Odd indices are exact preserved protected spans
-      if (idx % 2 === 1) return part;
+  const savedSpans: string[] = [];
+  const maskSpan = (match: string): string => {
+    const idx = savedSpans.push(match) - 1;
+    return `\uE000${idx}\uE001`;
+  };
 
-      if (target === 'uz_new') {
-        const hasCyr = /[а-яА-ЯёЁўқғҳЎҚҒҲ]/.test(part);
-        const latBase = hasCyr ? convertSegmentCyrToLat(part) : part;
-        return convertSegmentLatToNew(latBase);
-      }
+  const masked = text
+    .normalize('NFC')
+    .replace(PROTECTED_SYNTAX_RE, maskSpan)
+    .replace(PROTECTED_LEXICON_RE, maskSpan);
 
-      if (target === 'uz_cyr') {
-        return convertSegmentLatToCyr(part);
-      }
+  let converted = masked;
+  if (target === 'uz_new') {
+    const hasCyr = /[а-яА-ЯёЁўқғҳЎҚҒҲ]/.test(masked);
+    const latBase = hasCyr ? convertSegmentCyrToLat(masked) : masked;
+    converted = convertSegmentLatToNew(latBase);
+  } else if (target === 'uz_cyr') {
+    converted = convertSegmentLatToCyr(masked);
+  } else {
+    // target === 'uz_lat'
+    const fromNew = NEW_UZBEK_CHARS_RE.test(masked) ? convertSegmentNewToLat(masked) : masked;
+    converted = /[а-яА-ЯёЁўқғҳЎҚҒҲ]/.test(fromNew) ? convertSegmentCyrToLat(fromNew) : fromNew;
+  }
 
-      // target === 'uz_lat'
-      const fromNew = NEW_UZBEK_CHARS_RE.test(part) ? convertSegmentNewToLat(part) : part;
-      return /[а-яА-ЯёЁўқғҳЎҚҒҲ]/.test(fromNew) ? convertSegmentCyrToLat(fromNew) : fromNew;
-    })
-    .join('');
+  return converted.replace(/\uE000(\d+)\uE001/g, (_, idx) => savedSpans[Number(idx)] ?? '');
 }
 
 export function toNewUzbekLatin(text: string): string {
